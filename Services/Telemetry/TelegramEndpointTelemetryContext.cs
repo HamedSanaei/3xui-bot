@@ -83,10 +83,11 @@ public sealed class TelegramEndpointTelemetryContext : IDisposable
         or "FallbackPending" or "LocalLogoutPending" or "LocalLogoutUncertain" or "CloudWait" or "SwitchingToCloud"
         or "CloudRecovered" or "MigrationFailed" or "ManualInterventionRequired";
 
-    /// <summary>Recognizes the closed operator/automatic migration trigger vocabulary.</summary>
+    /// <summary>Recognizes the closed operator, automatic and newly registered tenant-startup migration trigger vocabulary.</summary>
     /// <param name="value">Optional serialized trigger; never an actor identifier or free-form explanation.</param>
     /// <returns>True only for unavailable or a supported trigger.</returns>
-    internal static bool IsFailoverTrigger(string value) => value is null or "manual" or "automatic_outage" or "automatic_failback" or "startup_recovery";
+    /// <remarks>The writer and report reader share this whitelist; legitimate tenant_startup events must not be dropped as malformed telemetry. Arbitrary actor identifiers and provider text remain forbidden.</remarks>
+    internal static bool IsFailoverTrigger(string value) => value is null or "manual" or "automatic_outage" or "automatic_failback" or "startup_recovery" or "tenant_startup";
 
     /// <summary>Restores the enclosing request route without retaining completed request history.</summary>
     /// <remarks>Dispose once in the same logical request scope, in reverse push order.</remarks>

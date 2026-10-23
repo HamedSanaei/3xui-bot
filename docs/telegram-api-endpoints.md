@@ -50,7 +50,7 @@ While the store is disabled, existing authority-aware token/capability probes ma
 
 - Missing/inaccessible file mapping, disabled endpoint management, unavailable tokenless Local preflight or missing independent owned Cloud control leave Cloud available without a Local login or logout.
   Management-disabled first startup still consumes the one-time preference; re-enabling endpoint management later does not migrate that already started Cloud route.
-- Local identity/readiness failure **after** Cloud logout schedules safe Cloud fallback. The original Cloud logout proof remains durable until Local cleanup is verified; Local logout commits its own at-most-once marker and acknowledgment, then the existing conservative ten-minute Cloud wait precedes strict Cloud readiness.
+- Local destination identity initialization **after** Cloud logout uses a separate 15-second deadline (configurable 15–60 seconds), subject to the outer migration-operation budget. A bot-specific timeout/readiness failure with a healthy shared root schedules same-Local safe-read retries, not Cloud fallback. Automatic fallback requires consecutive tokenless shared-root failures spanning at least 15 seconds. The original Cloud logout proof remains durable across retries/restart; if fallback is authorized, Local logout still commits its own at-most-once marker and acknowledgment, then the existing conservative ten-minute Cloud wait precedes strict Cloud readiness.
 - Unreachable Local cleanup retries only bounded safe reads. Token/identity rejection, refused cleanup and ambiguous logout remain fenced for intervention; no speculative Cloud login, repeated logout or replayed send is allowed.
 
 The owner sees queued startup rather than a false active connection, and the store remains enabled so hosted work can finish. If activation completes between runtime refusal and status observation, one serialized/idempotent runtime check proves actual receiver readiness before reporting success. The saved Local preference remains visible after Cloud fallback; default automatic failback remains off.
@@ -131,9 +131,11 @@ When Local is unreachable, bot-specific session cleanup cannot be proved. Fallba
 
 ## Health and automatic policy
 
-Default health interval 15 seconds, short read deadline 3 seconds, outage threshold 3 consecutive relevant failures, recovery threshold 2 consecutive successes. Shared tokenless health is checked once per cycle; identity reads target only already-Local eligible sessions. Normal empty long polling is healthy and is not an outage signal. Status refresh on an active Cloud identity performs only safe Cloud reads, never a prelogout Local login.
+Default health interval 15 seconds, short read deadline 3 seconds, outage threshold 3 consecutive **shared-root** failures spanning **at least 15 seconds**, recovery threshold 2 consecutive successes. Rapid refreshes cannot shorten this grace period. Shared root success resets the failure sequence; process restart conservatively starts a new grace period. The same shared outage evidence is applied to every eligible Local route, rather than interpreting one bot's timeout as a server outage. Shared tokenless health is checked once per cycle; identity reads target only already-Local eligible sessions. Normal empty long polling is healthy and is not an outage signal. Status refresh on an active Cloud identity performs only safe Cloud reads, never a prelogout Local login.
 
 Typed categories distinguish connection refusal, timeout/network, invalid Bot API response, token rejection/identity mismatch, rate limit and Telegram upstream failure. Telegram 429/5xx prove a different condition from an unavailable Local process; they do not trigger Local-server failover. Identity rejection requires intervention rather than a speculative endpoint switch. Failures are persisted without external exception text.
+
+Each failed identity probe additionally emits local structured `Telegram endpoint identity probe detail.` diagnostics: internal bot id, Local/Cloud label, closed failure/reason, numeric API error code and bounded RetryAfter seconds. Unknown 400 replies remain `telegram_bad_request`; known logged-out/method-unavailable reasons are mapped without retaining the raw description, token or request URL. This per-attempt detail family stays out of the Telegram channel; normal actionable migration/terminal alerts remain unchanged. The closed telemetry trigger schema accepts the coordinator's `tenant_startup`, preventing legitimate startup migration events from being rejected as telemetry loss. No historical records are rewritten and no database migration is needed.
 
 Outage episodes have stable ids and deduplicated alerts. New admissions are fenced, and the affected receiver is stopped under bot-specific lifecycle ownership. Safe recovery is bounded by configured attempts and exponential delay; no indefinitely repeated mutation occurs. Automatic failback is a separate explicit startup policy, disabled by default; when enabled it still executes the same Cloud logout protocol and recovery thresholds.
 
@@ -165,6 +167,7 @@ Add only the optional `telegramEndpointRouting` object to the existing persisten
     "localBaseUrl": "http://127.0.0.1:8081",
     "healthCheckIntervalSeconds": 15,
     "healthCheckTimeoutSeconds": 3,
+    "destinationReadinessTimeoutSeconds": 15,
     "failureThreshold": 3,
     "recoveryThreshold": 2,
     "automaticFailback": false,

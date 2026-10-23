@@ -372,21 +372,28 @@ public sealed partial class TelegramEndpointCoordinator
     /// <returns>A task completing with an active committed route or a fenced bounded safe retry.</returns>
     /// <remarks>The parent lifecycle checks webhook absence and nondropping short getUpdates. Identity and readiness
     /// failures retain their exact destination boundary across restart. New-tenant Local startup failures schedule
-    /// Cloud fallback rather than repeatedly attempting to activate Local. Cleanup proof, cooldown, strict
+    /// Local retries while the shared root is healthy; Cloud fallback requires sustained shared-service failure. Cleanup proof, cooldown, strict
     /// identity/readiness and ambiguous-error rules remain mandatory; existing routes retain their retry policy.</remarks>
     private async Task ActivateAsync(TelegramEndpointState state, TelegramEndpointType endpoint,
         ITelegramEndpointReceiverLease lease, CancellationToken token, CancellationToken shutdownToken)
     {
         TelegramEndpointProbeResult identity;
-        try { identity = await ProbeIdentityAsync(state, endpoint, token); }
+        try
+        {
+            identity = await BoundedProbeAsync(
+                budget => _protocol.VerifyIdentityAsync(state.BotId, state.TelegramBotId, endpoint, state.Generation, budget),
+                token, _options.DestinationReadinessTimeoutSeconds);
+        }
         catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested) { throw; }
         catch (Exception exception) { identity = new(TelegramEndpointHealthPolicy.Classify(exception)); }
+        LogIdentityFailure(state, endpoint, identity);
         if (!identity.Success)
         {
             await HandleDestinationFailureAsync(state, endpoint, identity.Failure, CancellationToken.None,
                 TelegramEndpointDiagnosticCatalog.ProbeCategory(endpoint == TelegramEndpointType.Local ? "local_destination_identity" : "cloud_destination_identity", identity.Failure));
             return;
         }
+        state.LastFailureCategory = null; // Successful identity supersedes the current error; historical receipts remain unchanged.
         state.Generation++;
         state.MigrationState = endpoint == TelegramEndpointType.Local
             ? TelegramEndpointMigrationState.SwitchingToLocal : TelegramEndpointMigrationState.SwitchingToCloud;
@@ -441,7 +448,8 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="category">Closed stage-qualified diagnostic for the failed destination; never external text or a secret.</param>
     /// <returns>A task completing after durable fenced fallback intent or the existing bounded safe-retry decision.</returns>
     /// <remarks>
-    /// Only tenant_startup with automatic fallback enabled may leave failed Local activation.
+    /// Only tenant_startup with automatic fallback enabled and sustained tokenless shared-root failure may leave failed Local activation.
+    /// A healthy root or less than 15 seconds of shared failure retains same-Local retries; a bot-specific timeout never proves global outage.
     /// The same startup operation and desired Local preference are retained; no logout proof is cleared.
     /// The next worker pass verifies Local session cleanup, persists its own non-replayable attempt and waits
     /// for acknowledged cleanup plus Cloud eligibility before starting the first Cloud receiver.
@@ -455,6 +463,14 @@ public sealed partial class TelegramEndpointCoordinator
             state.LogoutEndpoint != TelegramEndpointType.Cloud || !state.LogoutAcknowledgedAtUtc.HasValue ||
             failure is TelegramEndpointFailure.IdentityMismatch or TelegramEndpointFailure.TokenRejected or TelegramEndpointFailure.ConfigurationMissing)
         {
+            await ScheduleSafeRetryAsync(state, failure, token, category);
+            return;
+        }
+        await ProbeSharedAsync(token);
+        if (!IsSustainedLocalOutage())
+        {
+            // The source logout is already acknowledged. Retry only the authorized Local identity/readiness;
+            // never replay Cloud logout or infer that one slow new session means the shared server is down.
             await ScheduleSafeRetryAsync(state, failure, token, category);
             return;
         }

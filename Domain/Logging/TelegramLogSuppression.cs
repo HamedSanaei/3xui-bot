@@ -119,7 +119,7 @@ namespace Adminbot.Domain.Logging
         /// <remarks>
         /// The method intentionally suppresses only known noisy patterns: stale callbacks, unchanged Telegram edits,
         /// receipt-photo relay failures that have a text fallback, repeated tenant forced-join probes, routine XUI v3
-        /// volume-reminder scan summaries, per-attempt UniquePay GET-reconciliation diagnostics, the compact
+        /// volume-reminder scan summaries, per-attempt UniquePay GET-reconciliation and safe endpoint identity diagnostics, the compact
         /// <c>Telegram polling degraded</c> transient-backoff summary, Telegram polling 5xx/429/timeouts, the closed
         /// latency-telemetry families handled by <see cref="ShouldSuppressLatencyTelemetry"/>, the controlled guard
         /// outcomes handled by <see cref="ShouldSuppressControlledLatencyEvent"/>, the routine success families handled
@@ -215,6 +215,7 @@ namespace Adminbot.Domain.Logging
                 ContainsOrdinalIgnoreCase(combined, "tenant forced-join validation failed") ||
                 ContainsOrdinalIgnoreCase(combined, "tenant forced-join check failed") ||
                 ContainsOrdinalIgnoreCase(combined, "UniquePay inquiry retry detail:") ||
+                ContainsOrdinalIgnoreCase(combined, "Telegram endpoint identity probe detail.") ||
                 ContainsOrdinalIgnoreCase(combined, "Tenant UniquePay customer inquiry failed") ||
                 ContainsOrdinalIgnoreCase(combined, "UniquePay HTTP trigger inquiry failed") ||
                 ContainsOrdinalIgnoreCase(combined, "XUI v3 volume reminder scan finished.") ||

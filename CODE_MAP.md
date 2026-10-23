@@ -1741,7 +1741,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   `tenant_startup` preference in `TenantBotService`; existing Cloud/Local rows and token rotations are preserved.
   `MultiBotHostedService` arms intent before lifecycle locking, never starts an initial optimistic Cloud receiver,
   and bypasses preparation for worker-owned strict activation. Safe preflight failure permits Cloud immediately;
-  post-logout Local startup failure retains cleanup proof, performs Local logout and the existing ten-minute Cloud wait.
+  post-logout Local startup failure retains cleanup proof and retries Local while the shared root is healthy;
+  automatic fallback requires repeated shared-root failures spanning at least 15 seconds before safe Local logout/Cloud wait.
   Owner enable keeps safely queued startup enabled; completion races require a serialized real-receiver readiness check.
   Management-disabled first startup consumes its preference, preventing an unexpected Local migration on a later restart.
 - Migration `20261009120000_AddTelegramEndpointRouting` adds four endpoint-only users.db tables (state, append-only
@@ -1757,6 +1758,13 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   and zero-offset/non-dropping receiving readiness. Ambiguous/interrupted logout is manual intervention, never blindly repeated.
   Local→Cloud requires proven Local cleanup and persisted Cloud eligibility; conservative fresh ten-minute Local-logout wait.
   Unreachable Local cannot produce false Cloud success. Default automatic failback is off; desired and effective stay separate.
+- Ordinary health keeps its 3-second budget; authorized destination identity initialization uses optional
+  `destinationReadinessTimeoutSeconds` (default/minimum 15, maximum 60), within the outer migration budget.
+  A healthy root plus one bot's timeout only degrades that bot; shared-root success/restart resets automatic-outage grace.
+  Local structured identity diagnostics retain only API status/closed reason/bounded RetryAfter; the exact per-attempt
+  detail family is Telegram-channel-suppressed, not actionable migration/terminal alerts. `tenant_startup` is a valid
+  closed telemetry trigger, not a schema rejection. Success clears the current stale error without deleting history.
+  SwitchingToLocal retry notices explicitly describe Local rechecks, not a Cloud fallback that was never requested.
 - Strict receiver staging is lifecycle-owned: inventory/status reads of the same/older committed pending revision
   must not reset `Starting` or restore the saved source endpoint; genuinely newer restrictive receipts still fence it.
   Manual/bulk Cloud confirmations and CloudWait logger alerts explicitly describe the minimum ten-minute post-cleanup

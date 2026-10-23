@@ -9,7 +9,11 @@ namespace Adminbot.Services.TelegramEndpoints;
 
 /// <summary>Result of a single safe endpoint read, without tokens, response text or URLs.</summary>
 /// <param name="Failure">Closed failure category; None means the expected identity or root was verified.</param>
-public sealed record TelegramEndpointProbeResult(TelegramEndpointFailure Failure = TelegramEndpointFailure.None)
+/// <param name="ApiErrorCode">Optional numeric Telegram API rejection code; never inferred from raw response text.</param>
+/// <param name="ReasonCode">Optional closed safe reason, not the provider's description, response, token or URI.</param>
+/// <param name="RetryAfterSeconds">Optional positive provider retry delay in seconds, capped at one day for diagnostics only.</param>
+public sealed record TelegramEndpointProbeResult(TelegramEndpointFailure Failure = TelegramEndpointFailure.None,
+    int? ApiErrorCode = null, string ReasonCode = null, int? RetryAfterSeconds = null)
 {
     /// <summary>Whether this read verified the expected server or bot.</summary>
     public bool Success => Failure == TelegramEndpointFailure.None;
@@ -118,7 +122,7 @@ public sealed class TelegramEndpointProtocol : ITelegramEndpointProtocol, IDispo
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (JsonException) { return new(TelegramEndpointFailure.InvalidResponse); }
-        catch (Exception exception) { return new(TelegramEndpointHealthPolicy.Classify(exception)); }
+        catch (Exception exception) { return TelegramEndpointHealthPolicy.DescribeFailure(exception); }
     }
 
     /// <inheritdoc />
@@ -132,7 +136,7 @@ public sealed class TelegramEndpointProtocol : ITelegramEndpointProtocol, IDispo
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (BotTransportUnavailableException) { return new(TelegramEndpointFailure.ConfigurationMissing); }
-        catch (Exception exception) { return new(TelegramEndpointHealthPolicy.Classify(exception)); }
+        catch (Exception exception) { return TelegramEndpointHealthPolicy.DescribeFailure(exception); }
     }
 
     /// <inheritdoc />

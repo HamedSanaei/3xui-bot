@@ -840,7 +840,7 @@ public sealed class LatencyTelemetryReliabilityTests
         Assert.Null(TelegramEndpointTelemetryContext.Current);
     }
 
-    /// <summary>Endpoint schema projection persists every supported measurement while rejecting arbitrary labels, invalid numbers and non-UTC success timestamps.</summary>
+    /// <summary>Endpoint schema projection persists every supported measurement and tenant-startup trigger while rejecting arbitrary labels, invalid numbers and non-UTC success timestamps.</summary>
     /// <returns>A task verifying the real version-one writer rejects leakage without recursion or writer failures.</returns>
     /// <remarks>Migration diagnosis must survive file serialization: retaining only an error code while dropping its phase would hide whether admission or an irreversible operation failed.</remarks>
     [Fact]
@@ -859,6 +859,7 @@ public sealed class LatencyTelemetryReliabilityTests
         };
         foreach (var family in new[] { "telegram_endpoint_health", "telegram_endpoint_migration", "telegram_endpoint_outage", "telegram_endpoint_recovered" })
             Assert.True(service.TryRecord(safe with { EventType = family }));
+        Assert.True(service.TryRecord(safe with { FailoverTrigger = "tenant_startup" }));
         var unsafeRecords = new[]
         {
             safe with { EndpointType = "private-token" }, safe with { MigrationState = "raw_state_private" },
@@ -873,7 +874,8 @@ public sealed class LatencyTelemetryReliabilityTests
         Assert.Equal(unsafeRecords.Length, service.DroppedEvents);
         Assert.Equal(0, service.WriterFailures);
         var persisted = ReadEvents(files.TelemetryDirectory).Where(row => row.EventType.StartsWith("telegram_endpoint_", StringComparison.Ordinal)).ToArray();
-        Assert.Equal(4, persisted.Length);
+        Assert.Equal(5, persisted.Length);
+        Assert.Single(persisted, row => row.FailoverTrigger == "tenant_startup");
         Assert.All(persisted, row =>
         {
             Assert.Equal(1, row.SchemaVersion);
@@ -884,7 +886,7 @@ public sealed class LatencyTelemetryReliabilityTests
             Assert.Equal(safe.Operation, row.Operation);
             Assert.Equal(safe.FailureClassification, row.FailureClassification);
             Assert.Equal(safe.HealthCheckDurationMs, row.HealthCheckDurationMs);
-            Assert.Equal(safe.FailoverTrigger, row.FailoverTrigger);
+            Assert.Contains(row.FailoverTrigger, new[] { "automatic_outage", "tenant_startup" });
             Assert.Equal(safe.FailoverDurationMs, row.FailoverDurationMs);
             Assert.Equal(safe.CloudReuseRemainingMs, row.CloudReuseRemainingMs);
             Assert.Equal(safe.LastSuccessUtc, row.LastSuccessUtc);

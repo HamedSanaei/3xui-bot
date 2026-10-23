@@ -17,6 +17,192 @@ using Xunit;
 /// gate and coordinator are exercised with a CAS store, controlled clock and serialized receiver lifecycle.</remarks>
 public sealed partial class TelegramEndpointCoordinatorTests
 {
+    /// <summary>A new Local destination gets an independent fifteen-second identity budget, not the three-second health deadline.</summary>
+    /// <returns>A task proving delayed successful readiness starts only Local and never repeats source logout.</returns>
+    /// <remarks>The fake clock advances past the old deadline while the destination read is pending; no real API is called.</remarks>
+    [Fact]
+    public async Task Tenant_destination_identity_may_take_longer_than_health_probe()
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var response = new TaskCompletionSource<TelegramEndpointProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Protocol.IdentityOverride = (endpoint, _) =>
+        {
+            if (endpoint == TelegramEndpointType.Cloud) return Task.FromResult(new TelegramEndpointProbeResult());
+            entered.TrySetResult();
+            return response.Task;
+        };
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        var work = f.Coordinator.RunPendingOperationsAsync(default);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        f.Clock.Advance(TimeSpan.FromSeconds(4));
+        Assert.False(work.IsCompleted);
+        response.SetResult(new());
+        await work;
+        Assert.Equal(TelegramEndpointMigrationState.Local, (await f.StatusAsync()).MigrationState);
+        Assert.Equal(1, f.Protocol.LogoutCalls);
+        Assert.DoesNotContain("logout:Local", f.Protocol.Events);
+    }
+
+    /// <summary>A fifteen-second destination timeout retries the same Local route when the shared server is healthy.</summary>
+    /// <returns>A task proving no premature Cloud fallback, no duplicate logout and eventual same-Local recovery.</returns>
+    /// <remarks>A pending read deliberately ignores cancellation to exercise the coordinator-owned deadline.</remarks>
+    [Fact]
+    public async Task Tenant_destination_timeout_with_healthy_root_retries_local_instead_of_cloud()
+    {
+        using var f = new Fixture();
+        f.RegisterTenant();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Protocol.IdentityOverride = (endpoint, _) =>
+        {
+            if (endpoint == TelegramEndpointType.Cloud) return Task.FromResult(new TelegramEndpointProbeResult());
+            entered.TrySetResult();
+            return new TaskCompletionSource<TelegramEndpointProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        };
+        await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+        var work = f.Coordinator.RunPendingOperationsAsync(default);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        f.Clock.Advance(TimeSpan.FromSeconds(14));
+        Assert.False(work.IsCompleted);
+        f.Clock.Advance(TimeSpan.FromSeconds(1));
+        await work.WaitAsync(TimeSpan.FromSeconds(5));
+        var retry = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.SwitchingToLocal, retry.MigrationState);
+        Assert.NotNull(retry.LogoutAcknowledgedAtUtc);
+        Assert.Equal(0, f.Lifecycle.Starts);
+        Assert.DoesNotContain("logout:Local", f.Protocol.Events);
+        f.Protocol.IdentityOverride = null;
+        f.RestartCoordinator();
+        f.Clock.Advance(retry.NextAttemptAtUtc!.Value - f.Clock.GetUtcNow().UtcDateTime);
+        await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(TelegramEndpointMigrationState.Local, (await f.StatusAsync()).MigrationState);
+        Assert.Equal(1, f.Protocol.LogoutCalls);
+        Assert.Equal(1, f.Lifecycle.MaximumReceivers);
+    }
+
+    /// <summary>Repeated bot-specific identity timeouts cannot declare a shared Local outage or interrupt other bots.</summary>
+    /// <returns>A task proving both Local routes stay admitted without a migration/logout intent.</returns>
+    [Fact]
+    public async Task Healthy_shared_root_prevents_automatic_fallback_for_individual_identity_timeouts()
+    {
+        using var f = new Fixture(TelegramEndpointType.Local, includeSecondBot: true);
+        await f.InitializeAsync();
+        f.Protocol.LocalFailure = TelegramEndpointFailure.Timeout;
+        for (var index = 0; index < 6; index++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(15));
+        }
+        var state = await f.StatusAsync();
+        Assert.Equal(TelegramEndpointMigrationState.LocalDegraded, state.MigrationState);
+        Assert.Null(state.OutageId);
+        Assert.Null(state.OperationId);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        Assert.True(f.Gate.IsAvailable("owned-b", 234));
+        Assert.Equal(0, f.Protocol.LogoutCalls);
+    }
+
+    /// <summary>Rapid root failures cannot bypass the minimum grace period; a proven shared outage affects all Local routes.</summary>
+    /// <returns>A task proving root success and restart reset the grace period before both bots become fallback-pending.</returns>
+    [Fact]
+    public async Task Shared_outage_requires_fifteen_seconds_and_resets_on_success_or_restart()
+    {
+        using var f = new Fixture(TelegramEndpointType.Local, includeSecondBot: true);
+        await f.InitializeAsync();
+        f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
+        for (var index = 0; index < 4; index++) await f.Coordinator.RunHealthCycleAsync(default);
+        f.Clock.Advance(TimeSpan.FromSeconds(14));
+        await f.Coordinator.RunHealthCycleAsync(default);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        f.Protocol.RootFailure = TelegramEndpointFailure.None;
+        await f.Coordinator.RunHealthCycleAsync(default);
+        f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
+        await f.Coordinator.RunHealthCycleAsync(default);
+        f.Clock.Advance(TimeSpan.FromSeconds(15));
+        f.RestartCoordinator();
+        for (var index = 0; index < 3; index++) await f.Coordinator.RunHealthCycleAsync(default);
+        Assert.True(f.Gate.IsAvailable("owned-a", 123));
+        f.Clock.Advance(TimeSpan.FromSeconds(15));
+        await f.Coordinator.RunHealthCycleAsync(default);
+        Assert.Equal(TelegramEndpointMigrationState.FallbackPending, (await f.StatusAsync()).MigrationState);
+        Assert.Equal(TelegramEndpointMigrationState.FallbackPending,
+            (await f.Coordinator.GetStatusAsync("owned-b", default)).MigrationState);
+        Assert.False(f.Gate.IsAvailable("owned-a", 123));
+        Assert.False(f.Gate.IsAvailable("owned-b", 234));
+        Assert.Equal(0, f.Protocol.LogoutCalls);
+    }
+
+    /// <summary>Provider diagnostics keep useful status codes while discarding arbitrary error descriptions and private URLs.</summary>
+    /// <param name="code">Synthetic Telegram API status code, never a production response.</param>
+    /// <param name="description">Untrusted synthetic response description used only inside the closed classifier.</param>
+    /// <param name="reason">Expected safe allowlisted reason.</param>
+    [Theory]
+    [InlineData(400, "Bad Request: secret-url/bot123:PRIVATE", "telegram_bad_request")]
+    [InlineData(400, "Bad Request: Logged out", "telegram_logged_out")]
+    [InlineData(400, "Method not available", "telegram_method_unavailable")]
+    [InlineData(401, "PRIVATE", "telegram_token_rejected")]
+    [InlineData(500, "PRIVATE", "telegram_upstream")]
+    public void Identity_failure_diagnostics_are_closed_and_secret_free(int code, string description, string reason)
+    {
+        var result = TelegramEndpointHealthPolicy.DescribeFailure(new ApiRequestException(description, code));
+        Assert.Equal(code, result.ApiErrorCode);
+        Assert.Equal(reason, result.ReasonCode);
+        Assert.DoesNotContain("PRIVATE", JsonSerializer.Serialize(result), StringComparison.Ordinal);
+        Assert.Equal(TelegramEndpointHealthPolicy.Classify(new ApiRequestException(description, code)), result.Failure);
+    }
+
+    /// <summary>Provider retry metadata stays bounded and diagnostic-only without changing the existing throttling classification.</summary>
+    /// <param name="seconds">Synthetic provider RetryAfter seconds, including missing-equivalent zero and an excessive value.</param>
+    /// <param name="expected">Expected nullable bounded diagnostic delay in seconds.</param>
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(7, 7)]
+    [InlineData(int.MaxValue, 86400)]
+    public void Identity_failure_retry_after_is_bounded(int seconds, int? expected)
+    {
+        var exception = new ApiRequestException("private fixture description", 429,
+            new Telegram.Bot.Types.ResponseParameters { RetryAfter = seconds });
+        var result = TelegramEndpointHealthPolicy.DescribeFailure(exception);
+        Assert.Equal(expected, result.RetryAfterSeconds);
+        Assert.Equal("telegram_rate_limited", result.ReasonCode);
+        Assert.Equal(TelegramEndpointFailure.RateLimited, result.Failure);
+    }
+
+    /// <summary>Actual tenant-startup migration events survive the real closed JSONL schema without producing false writer-loss incidents.</summary>
+    /// <returns>A task proving coordinator-produced startup events are persisted and no event is rejected or lost.</returns>
+    /// <remarks>The writer uses a disposable scratch directory and the migration protocol uses fake APIs only.</remarks>
+    [Fact]
+    public async Task Tenant_startup_migration_is_accepted_by_real_telemetry_writer()
+    {
+        using var f = new Fixture(includeTelemetry: true);
+        f.RegisterTenant();
+        var telemetry = f.Telemetry!;
+        await telemetry.StartAsync(default);
+        try
+        {
+            await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
+            await f.Coordinator.RunPendingOperationsAsync(default);
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        }
+        finally { await telemetry.StopAsync(default); }
+        Assert.Equal(0, telemetry.DroppedEvents);
+        Assert.Equal(0, telemetry.WriterFailures);
+        var rows = Directory.GetFiles(telemetry.StorageDirectory, "*.jsonl").SelectMany(File.ReadLines)
+            .Select(line => { using var json = JsonDocument.Parse(line); return json.RootElement.Clone(); }).ToArray();
+        Assert.Contains(rows, row => row.GetProperty("eventType").GetString() == "telegram_endpoint_migration" &&
+            row.GetProperty("failoverTrigger").GetString() == "tenant_startup");
+    }
+
+    /// <summary>Destination initialization cannot be configured below the grace requirement or above the bounded read ceiling.</summary>
+    /// <param name="seconds">Configured destination identity deadline in seconds.</param>
+    [Theory]
+    [InlineData(14)]
+    [InlineData(61)]
+    public void Destination_readiness_timeout_rejects_unsafe_bounds(int seconds)
+        => Assert.Throws<ArgumentException>(() => new TelegramEndpointRoutingOptions
+            { DestinationReadinessTimeoutSeconds = seconds }.ValidateAndSnapshot());
+
     /// <summary>A freshly registered tenant's first receiving path is Local, with no optimistic Cloud receiver or repeated startup intent.</summary>
     /// <returns>A task after durable intent, exact protocol ordering and first receiver readiness are verified.</returns>
     /// <remarks>Cloud getMe is token validation, not receiving; Local login still requires acknowledged Cloud logout.</remarks>
@@ -111,7 +297,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         Assert.Equal(state.Revision, (await f.StatusAsync()).Revision);
     }
 
-    /// <summary>Failed initial Local identity or receiver readiness falls back only after Local cleanup and the persisted Cloud cooldown.</summary>
+    /// <summary>Failed initial readiness falls back only after sustained shared-service outage, Local cleanup and the persisted Cloud cooldown.</summary>
     /// <param name="receiverFailure">True fails strict receiver readiness; false fails the session-creating Local identity request.</param>
     /// <returns>A task after the first successful receiver is Cloud and no Cloud login occurs during unsafe cleanup/wait.</returns>
     /// <remarks>Even a failed Local getMe may create a session; fallback must never be a BaseUrl swap.</remarks>
@@ -126,6 +312,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         else f.Protocol.LocalFailure = TelegramEndpointFailure.Network;
         await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
         await f.Coordinator.RunPendingOperationsAsync(default);
+        Assert.Equal(TelegramEndpointMigrationState.SwitchingToLocal, (await f.StatusAsync()).MigrationState);
+        await f.ProveTenantLocalOutageAsync();
         var fallback = await f.StatusAsync();
         Assert.Equal(TelegramEndpointMigrationState.FallbackPending, fallback.MigrationState);
         Assert.Equal(TelegramEndpointType.Cloud, fallback.LogoutEndpoint);
@@ -167,6 +355,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Protocol.LocalFailure = TelegramEndpointFailure.Network;
         await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
         await f.Coordinator.RunPendingOperationsAsync(default);
+        await f.ProveTenantLocalOutageAsync();
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
         await f.Coordinator.RunPendingOperationsAsync(default);
         var pending = await f.StatusAsync();
@@ -193,6 +382,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Lifecycle.Ready = false;
         await f.Coordinator.PrepareTenantStartupAsync("owned-a", default);
         await f.Coordinator.RunPendingOperationsAsync(default);
+        await f.ProveTenantLocalOutageAsync();
         f.Lifecycle.Ready = true;
         f.Protocol.LogoutResult = new(false, uncertain, uncertain ? TelegramEndpointFailure.LogoutUncertain : TelegramEndpointFailure.LogoutRefused);
         await f.Coordinator.RunPendingOperationsAsync(default);
@@ -674,6 +864,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
         {
             await f.Coordinator.RefreshHealthAsync("owned-a", default);
             Assert.True(f.Gate.IsAvailable("owned-a", 123));
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
         }
         await f.Coordinator.RefreshHealthAsync("owned-a", default);
         var incident = (await f.StatusAsync()).OutageId;
@@ -731,7 +922,11 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Store.Mutate(x => x.AutoFailoverEnabled = automaticFailover);
         await f.InitializeAsync();
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
-        for (var i = 0; i < 3; i++) await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        for (var i = 0; i < 3; i++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
+        }
         f.Protocol.RootFailure = TelegramEndpointFailure.None;
         await f.Coordinator.RefreshHealthAsync("owned-a", default);
         Assert.False(f.Gate.IsAvailable("owned-a", 123));
@@ -752,7 +947,11 @@ public sealed partial class TelegramEndpointCoordinatorTests
         using var f = new Fixture(TelegramEndpointType.Local);
         await f.InitializeAsync();
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
-        for (var i = 0; i < 3; i++) await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        for (var i = 0; i < 3; i++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
+        }
         f.Protocol.RootFailure = TelegramEndpointFailure.None;
         await f.Coordinator.RunPendingOperationsAsync(default);
         Assert.Equal(TelegramEndpointMigrationState.CloudWait, (await f.StatusAsync()).MigrationState);
@@ -774,7 +973,11 @@ public sealed partial class TelegramEndpointCoordinatorTests
         using var f = new Fixture(TelegramEndpointType.Local);
         await f.InitializeAsync();
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
-        for (var index = 0; index < 3; index++) await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        for (var index = 0; index < 3; index++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
+        }
         f.Protocol.RootFailure = TelegramEndpointFailure.None;
         await f.Coordinator.RunPendingOperationsAsync(default);
         f.Clock.Advance(TimeSpan.FromMinutes(10));
@@ -996,7 +1199,11 @@ public sealed partial class TelegramEndpointCoordinatorTests
         await f.InitializeAsync();
         f.AddAlias(enabled);
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
-        for (var index = 0; index < 3; index++) await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        for (var index = 0; index < 3; index++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
+        }
         var state = await f.StatusAsync();
         Assert.Equal(TelegramEndpointMigrationState.LocalUnavailable, state.MigrationState);
         Assert.Equal("identity_alias_conflict", state.LastFailureCategory);
@@ -1136,7 +1343,11 @@ public sealed partial class TelegramEndpointCoordinatorTests
         f.Store.Mutate(x => x.AutoFailoverEnabled = false);
         await f.InitializeAsync();
         f.Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
-        for (var i = 0; i < 3; i++) await f.Coordinator.RefreshHealthAsync("owned-a", default);
+        for (var i = 0; i < 3; i++)
+        {
+            await f.Coordinator.RefreshHealthAsync("owned-a", default);
+            f.Clock.Advance(TimeSpan.FromSeconds(7.5));
+        }
         await f.Coordinator.RunPendingOperationsAsync(default);
         Assert.Equal(0, f.Lifecycle.ActiveReceivers);
         Assert.Equal(TelegramEndpointMigrationState.LocalUnavailable, (await f.StatusAsync()).MigrationState);
@@ -1253,6 +1464,21 @@ public sealed partial class TelegramEndpointCoordinatorTests
         /// <summary>Hydrates saved fake state exactly as production prehost initialization does.</summary>
         /// <returns>The completed route hydration task.</returns>
         internal Task InitializeAsync() => Coordinator.InitializeAsync(default);
+        /// <summary>Proves a shared-root outage over fifteen simulated seconds before retrying failed tenant initialization.</summary>
+        /// <returns>A task leaving the tenant in safe fallback with the original Cloud logout proof; no cleanup is replayed.</returns>
+        /// <remarks>The caller must first fail initial Local identity or readiness. The fake root is restored afterwards so existing cleanup/cooldown tests can exercise their own failures.</remarks>
+        internal async Task ProveTenantLocalOutageAsync()
+        {
+            Protocol.RootFailure = TelegramEndpointFailure.ConnectionRefused;
+            for (var index = 0; index < 3; index++)
+            {
+                if (index > 0) Clock.Advance(TimeSpan.FromSeconds(7.5));
+                await Coordinator.RunHealthCycleAsync(default);
+            }
+            await Coordinator.RunPendingOperationsAsync(default);
+            Assert.Equal(TelegramEndpointMigrationState.FallbackPending, (await StatusAsync()).MigrationState);
+            Protocol.RootFailure = TelegramEndpointFailure.None;
+        }
         /// <summary>Reads the single exact fixture identity's detached status.</summary>
         /// <returns>The current durable fake state.</returns>
         internal Task<TelegramEndpointState> StatusAsync() => Coordinator.GetStatusAsync("owned-a", default);
@@ -1415,6 +1641,8 @@ public sealed partial class TelegramEndpointCoordinatorTests
         internal TelegramEndpointLogoutResult LogoutResult { get; set; } = new(true, false);
         /// <summary>Optional noncooperating safe-read transport for controlled deadline tests.</summary>
         internal Func<CancellationToken, Task<TelegramEndpointProbeResult>>? RootOverride { get; set; }
+        /// <summary>Optional controlled identity response for independent destination-initialization deadline tests.</summary>
+        internal Func<TelegramEndpointType, CancellationToken, Task<TelegramEndpointProbeResult>>? IdentityOverride { get; set; }
         /// <summary>Controlled registry/clock change after a source identity read but before the logout boundary.</summary>
         internal Action<TelegramEndpointType>? IdentityVerified { get; set; }
         /// <summary>Optional noncooperating mutation transport; a timed-out dispatch must never be replayed.</summary>
@@ -1446,6 +1674,7 @@ public sealed partial class TelegramEndpointCoordinatorTests
                     "Local getMe before acknowledged Cloud logout would create an unsafe session.");
             Events.Enqueue("identity:" + endpoint);
             IdentityVerified?.Invoke(endpoint);
+            if (IdentityOverride != null) return await IdentityOverride(endpoint, cancellationToken);
             return new(endpoint == TelegramEndpointType.Local ? LocalFailure : CloudFailure);
         }
         /// <inheritdoc />

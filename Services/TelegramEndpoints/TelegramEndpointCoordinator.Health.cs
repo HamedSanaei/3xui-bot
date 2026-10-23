@@ -8,7 +8,8 @@ public sealed partial class TelegramEndpointCoordinator
     /// <summary>Checks tokenless Local reachability, already-local bot identity and manual/automatic failback recovery notices.</summary>
     /// <param name="cancellationToken">Hosted worker shutdown token for short, bounded read budgets.</param>
     /// <returns>A task completing after the inventory scan; Cloud bots are never Local-probed by health.</returns>
-    /// <remarks>Defaults are 15-second cadence, 3-second budgets, three local transport failures and two recovery successes.
+    /// <remarks>Defaults are 15-second cadence, 3-second health budgets, three shared-root failures spanning at least 15 seconds and two recovery successes.
+    /// A per-bot identity failure with a healthy shared root cannot authorize automatic Cloud fallback.
     /// CloudRecovered bots receive a deduplicated tokenless server-recovered alert even when failback remains manual.</remarks>
     public async Task RunHealthCycleAsync(CancellationToken cancellationToken)
     {
@@ -55,6 +56,7 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="root">Tokenless shared root result from this health cycle.</param>
     /// <param name="token">Caller-owned cancellation for safe probes and persistence.</param>
     /// <returns>A task completing after metadata or a deduplicated outage/recovery transition.</returns>
+    /// <remarks>Only a shared-root failure sequence spanning at least fifteen seconds can authorize automatic fallback. An individual timeout leaves Local admitted/degraded; authoritative credential/identity rejection still fences that bot for intervention. No logout is dispatched here.</remarks>
     private async Task RefreshBotHealthAsync(string botId, TelegramEndpointProbeResult root, CancellationToken token)
     {
         var bot = FindBot(botId);
@@ -135,7 +137,7 @@ public sealed partial class TelegramEndpointCoordinator
                 else if (TelegramEndpointHealthPolicy.IsServerOutage(probe.Failure))
                 {
                     state.ConsecutiveFailures = Math.Min(_options.FailureThreshold, state.ConsecutiveFailures + 1);
-                    if (state.ConsecutiveFailures >= _options.FailureThreshold)
+                    if (!root.Success && IsSustainedLocalOutage())
                     {
                         _gate.Fence(state.BotId, state.TelegramBotId);
                         var first = state.OutageId == null || IsActive(state);
@@ -239,6 +241,7 @@ public sealed partial class TelegramEndpointCoordinator
     /// <summary>Runs one short tokenless root read and atomically publishes immutable shared-process metadata.</summary>
     /// <param name="token">Caller lifetime; the configured short health budget is added independently.</param>
     /// <returns>A typed official-root verification outcome; no bot token is used.</returns>
+    /// <remarks>Serialized probes publish consecutive failures and their first observation together. A successful probe clears the outage grace; restart starts fresh. This process-local health evidence does not alter durable session/logout proof.</remarks>
     private async Task<TelegramEndpointProbeResult> ProbeSharedAsync(CancellationToken token)
     {
         await _sharedProbe.WaitAsync(token);
@@ -249,10 +252,23 @@ public sealed partial class TelegramEndpointCoordinator
                 ? Math.Min(_options.RecoveryThreshold, _sharedRootSuccesses + 1) : 0);
             var previous = SharedLocalHealth;
             Volatile.Write(ref _sharedHealth, new TelegramEndpointSharedHealth(result.Success, UtcNow,
-                result.Success ? UtcNow : previous.LastSuccessAtUtc, TelegramEndpointHealthPolicy.Code(result.Failure)));
+                result.Success ? UtcNow : previous.LastSuccessAtUtc, TelegramEndpointHealthPolicy.Code(result.Failure),
+                result.Success ? 0 : Math.Min(_options.FailureThreshold, previous.ConsecutiveFailures + 1),
+                result.Success ? null : previous.FirstFailureAtUtc ?? UtcNow));
             return result;
         }
         finally { _sharedProbe.Release(); }
+    }
+
+    /// <summary>Requires repeated tokenless shared-service failures and a minimum grace period before automatic Cloud fallback.</summary>
+    /// <returns>True only after the configured failure threshold and at least 15 seconds of uninterrupted shared-root failure; never for an isolated bot timeout.</returns>
+    /// <remarks>Reads an immutable process-local snapshot. Success clears the sequence; restart delays rather than accelerates automatic fallback. No session or durable mutation occurs.</remarks>
+    /// <example><code>if (IsSustainedLocalOutage()) { /* Apply the existing durable cleanup/cooldown protocol. */ }</code></example>
+    private bool IsSustainedLocalOutage()
+    {
+        var health = SharedLocalHealth;
+        return !health.Reachable && health.ConsecutiveFailures >= _options.FailureThreshold &&
+            health.FirstFailureAtUtc.HasValue && UtcNow - health.FirstFailureAtUtc.Value >= TimeSpan.FromSeconds(15);
     }
 
     /// <summary>Runs a short identity read on an endpoint already authorized by the durable protocol phase.</summary>
@@ -260,21 +276,44 @@ public sealed partial class TelegramEndpointCoordinator
     /// <param name="endpoint">Explicit authorized source or destination.</param>
     /// <param name="token">Whole-operation or safe foreground lifetime.</param>
     /// <returns>A bounded exact-identity outcome; the transport never retries the request.</returns>
-    private Task<TelegramEndpointProbeResult> ProbeIdentityAsync(TelegramEndpointState state,
-        TelegramEndpointType endpoint, CancellationToken token) => BoundedProbeAsync(
+    /// <remarks>Uses the ordinary health deadline, not the longer destination initialization budget. Failed attempts retain sanitized structured diagnostics locally without duplicating operator-channel incident alerts.</remarks>
+    /// <exception cref="OperationCanceledException">The caller lifetime expires; an independently expired read deadline instead returns Timeout.</exception>
+    private async Task<TelegramEndpointProbeResult> ProbeIdentityAsync(TelegramEndpointState state,
+        TelegramEndpointType endpoint, CancellationToken token)
+    {
+        var result = await BoundedProbeAsync(
             budget => _protocol.VerifyIdentityAsync(state.BotId, state.TelegramBotId, endpoint, state.Generation, budget), token);
+        LogIdentityFailure(state, endpoint, result);
+        return result;
+    }
+
+    /// <summary>Retains numeric API rejection and closed safe reasons locally without mirroring every probe attempt into the operator channel.</summary>
+    /// <param name="state">Exact current bot state; only its internal id is logged, never its token or private API URL.</param>
+    /// <param name="endpoint">Authorized Local or Cloud endpoint just observed.</param>
+    /// <param name="result">Safe typed probe result whose reason comes only from the closed classifier.</param>
+    /// <remarks>Standard application logging retains each attempt. Channel suppression matches this exact detail family; existing migration failures and terminal alerts remain visible. No raw exception is supplied to logging.</remarks>
+    private void LogIdentityFailure(TelegramEndpointState state, TelegramEndpointType endpoint, TelegramEndpointProbeResult result)
+    {
+        if (!result.Success)
+            _logger.LogWarning("Telegram endpoint identity probe detail. BotId={BotId} Endpoint={Endpoint} Failure={Failure} ApiErrorCode={ApiErrorCode} ReasonCode={ReasonCode} RetryAfterSeconds={RetryAfterSeconds}",
+                state.BotId, endpoint, TelegramEndpointHealthPolicy.Code(result.Failure), result.ApiErrorCode, result.ReasonCode, result.RetryAfterSeconds);
+    }
 
     /// <summary>Enforces a short safe-read budget even when an injected transport ignores cancellation.</summary>
     /// <param name="probe">Non-retrying safe root or authorized identity read.</param>
     /// <param name="token">Caller cancellation; genuine host/caller cancellation is propagated.</param>
+    /// <param name="timeoutSeconds">Optional positive destination initialization budget in seconds; null keeps the ordinary configured health deadline.</param>
     /// <returns>Success or a typed timeout/transport classification without retaining error text.</returns>
+    /// <remarks>The caller's outer operation budget can expire earlier. The helper retries nothing and never dispatches logout or changes endpoint state; destination initialization passes the separately validated 15–60 second budget.</remarks>
+    /// <exception cref="OperationCanceledException">The caller's cancellation token is canceled; independent safe-read timeouts are returned as classified results.</exception>
+    /// <example><code>var root = await BoundedProbeAsync(_protocol.ProbeLocalServerAsync, token);</code></example>
     private async Task<TelegramEndpointProbeResult> BoundedProbeAsync(
-        Func<CancellationToken, Task<TelegramEndpointProbeResult>> probe, CancellationToken token)
+        Func<CancellationToken, Task<TelegramEndpointProbeResult>> probe, CancellationToken token, int? timeoutSeconds = null)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(_options.HealthCheckTimeoutSeconds), _time);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds ?? _options.HealthCheckTimeoutSeconds), _time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, timeout.Token);
         try { return await probe(linked.Token).WaitAsync(linked.Token); }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-        catch (Exception exception) { return new(TelegramEndpointHealthPolicy.Classify(exception)); }
+        catch (Exception exception) { return TelegramEndpointHealthPolicy.DescribeFailure(exception); }
     }
 }

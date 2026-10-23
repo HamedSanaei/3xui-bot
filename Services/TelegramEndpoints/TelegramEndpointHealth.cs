@@ -39,12 +39,39 @@ public enum TelegramEndpointFailure
 /// <param name="LastCheckedAtUtc">Latest bounded probe time, or null before any probe.</param>
 /// <param name="LastSuccessAtUtc">Latest verified root response time, or null if never verified.</param>
 /// <param name="ErrorCategory">Closed failure code, or null after success; never response text or a URL.</param>
+/// <param name="ConsecutiveFailures">Process-local consecutive tokenless root transport failures; successful reads reset this count.</param>
+/// <param name="FirstFailureAtUtc">First UTC root failure in the current uninterrupted sequence; restart conservatively starts a new grace period.</param>
 public sealed record TelegramEndpointSharedHealth(bool Reachable = false, DateTime? LastCheckedAtUtc = null,
-    DateTime? LastSuccessAtUtc = null, string ErrorCategory = null);
+    DateTime? LastSuccessAtUtc = null, string ErrorCategory = null, int ConsecutiveFailures = 0, DateTime? FirstFailureAtUtc = null);
 
 /// <summary>Applies endpoint-specific failure classification and bounded retry arithmetic without network access.</summary>
 public static class TelegramEndpointHealthPolicy
 {
+    /// <summary>Extracts safe numeric and closed-vocabulary diagnostic facts without retaining provider content.</summary>
+    /// <param name="exception">Caught SDK/transport exception; descriptions are inspected only for fixed known reasons and are never returned or logged.</param>
+    /// <returns>A secret-free probe result preserving existing retry classification, optional API error code and bounded RetryAfter seconds.</returns>
+    /// <remarks>Unknown 400 responses remain generic bad_request rather than guessed credential/cooldown failures. This helper never retries, mutates sessions or changes financial state.</remarks>
+    /// <example><code>var result = TelegramEndpointHealthPolicy.DescribeFailure(new ApiRequestException("Bad Request", 400));</code></example>
+    public static TelegramEndpointProbeResult DescribeFailure(Exception exception)
+    {
+        var failure = Classify(exception);
+        if (exception is not ApiRequestException api) return new(failure, ReasonCode: Code(failure));
+        var reason = api.ErrorCode switch
+        {
+            400 when api.Message?.Contains("logged out", StringComparison.OrdinalIgnoreCase) == true => "telegram_logged_out",
+            400 when api.Message?.Contains("not available", StringComparison.OrdinalIgnoreCase) == true => "telegram_method_unavailable",
+            400 => "telegram_bad_request",
+            404 => "telegram_not_found",
+            401 or 403 => "telegram_token_rejected",
+            409 => "telegram_conflict",
+            429 => "telegram_rate_limited",
+            >= 500 => "telegram_upstream",
+            _ => "telegram_rejected"
+        };
+        var retry = api.Parameters?.RetryAfter;
+        return new(failure, api.ErrorCode, reason, retry is > 0 ? Math.Min(retry.Value, 86400) : null);
+    }
+
     /// <summary>Identifies failures that can count toward a sustained local-server outage.</summary>
     /// <param name="failure">Closed outcome from a tokenless root or an already-local identity probe.</param>
     /// <returns>True only for local transport, timeout or invalid-root failures; 429 and Telegram 5xx never count.</returns>

@@ -338,7 +338,7 @@ public sealed class TelegramEndpointNotificationWorker : BackgroundService
     /// <summary>Renders safe Persian operator text at send time rather than persisting a body.</summary>
     /// <param name="alert">Secret-free frozen incident metadata.</param>
     /// <returns>Plain-text Persian alert with fixed category labels and safe bot identity.</returns>
-    /// <remarks>Frozen CloudWait receipts describe acknowledged cleanup and a scheduled ten-minute wait, not an active Cloud receiver or unfinished Local cleanup. No extra notification or probe is created.</remarks>
+    /// <remarks>Frozen CloudWait receipts describe acknowledged cleanup and a scheduled ten-minute wait, not an active Cloud receiver or unfinished Local cleanup. SwitchingToLocal retry receipts describe Local rechecks, never an unrequested Cloud fallback. No extra notification or probe is created.</remarks>
     private static string Render(TelegramEndpointAlert alert)
     {
         var title = alert.Category switch
@@ -348,6 +348,7 @@ public sealed class TelegramEndpointNotificationWorker : BackgroundService
             "migration_succeeded" => "انتقال Telegram API تکمیل شد",
             "local_outage" => "سرویس Local Telegram API از دسترس خارج شد",
             "local_recovered" => "سرویس Local Telegram API بازیابی شد",
+            "fallback_pending" when alert.MigrationState == TelegramEndpointMigrationState.SwitchingToLocal => "آماده‌سازی Local دوباره بررسی می‌شود؛ انتقال به Cloud ثبت نشده است",
             "fallback_pending" when alert.MigrationState == TelegramEndpointMigrationState.CloudWait => "خروج Local تأیید شد؛ فعال‌سازی Cloud در انتظار مهلت ایمنی است",
             "fallback_pending" => "بازیابی Cloud منتظر پاک‌سازی ایمن Local است",
             "cloud_recovered" => "سرویس ربات روی Cloud بازیابی شد",

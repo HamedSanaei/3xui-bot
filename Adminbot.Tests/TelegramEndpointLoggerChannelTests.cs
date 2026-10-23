@@ -14,6 +14,24 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>A failed Local destination read with healthy shared service must not announce that Cloud recovery has begun.</summary>
+    /// <remarks>The existing retry receipt remains deduplicated; rendering changes neither notification delivery nor routing state.</remarks>
+    [Fact]
+    public void Endpoint_local_readiness_retry_alert_does_not_claim_cloud_fallback()
+    {
+        var render = typeof(TelegramEndpointNotificationWorker).GetMethod("Render",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var text = (string)render.Invoke(null, new object[] { new TelegramEndpointAlert
+        {
+            BotId = "synthetic", TelegramBotId = 123456, Category = "fallback_pending",
+            MigrationState = TelegramEndpointMigrationState.SwitchingToLocal,
+            DesiredEndpoint = TelegramEndpointType.Local, EffectiveEndpoint = TelegramEndpointType.Cloud
+        } })!;
+        Assert.Contains("آماده‌سازی Local دوباره بررسی می‌شود", text);
+        Assert.Contains("انتقال به Cloud ثبت نشده است", text);
+        Assert.DoesNotContain("بازیابی Cloud منتظر", text);
+    }
+
     /// <summary>The frozen CloudWait alert must describe completed cleanup and a paused receiver, not an already active Cloud route.</summary>
     /// <remarks>Rendering alone has no send, wallet, receiver, or database side effect.</remarks>
     [Fact]
@@ -493,7 +511,7 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>Raw provider errors and credentials never reach persisted categories, rendered incident text or recursive Telegram logger fallback.</summary>
-    /// <returns>A task completing after fixed warnings are locally captured and only the exact retained-worker warning is channel-suppressed.</returns>
+    /// <returns>A task completing after fixed warnings are locally captured and only retained-worker/per-attempt identity details are channel-suppressed, not actionable failures.</returns>
     [Fact]
     public async Task Endpoint_logger_failures_are_secret_free_and_suppression_is_narrow()
     {
@@ -516,6 +534,8 @@ public sealed partial class ConcurrencyTests
         Assert.False(TelegramLogSuppression.ShouldSuppress("Telegram endpoint receiver cleanup deferred. Category=receiver_join_timeout", null!));
         Assert.False(TelegramLogSuppression.ShouldSuppress("Telegram endpoint operator alert retained. category=send_uncertain", new InvalidOperationException("real failure")));
         Assert.False(TelegramLogSuppression.ShouldSuppress("Customer delivery failed", null!));
+        Assert.True(TelegramLogSuppression.ShouldSuppress("Telegram endpoint identity probe detail. BotId=owned-a Endpoint=Cloud ApiErrorCode=400 ReasonCode=telegram_bad_request", null!));
+        Assert.False(TelegramLogSuppression.ShouldSuppress("Telegram endpoint migration rejected or deferred. ErrorCode=CLOUD_DESTINATION_IDENTITY_TIMEOUT", null!));
     }
 
     /// <summary>A worker cannot count one gate while borrowing a different transport's uncounted Cloud authority.</summary>

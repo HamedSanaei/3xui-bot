@@ -15,7 +15,10 @@ public sealed class TelegramEndpointRoutingOptions
     public int HealthCheckIntervalSeconds { get; set; } = 15;
     /// <summary>One health request deadline in seconds, bounded from 1 to 30.</summary>
     public int HealthCheckTimeoutSeconds { get; set; } = 3;
-    /// <summary>Consecutive relevant health failures needed to declare an outage, from 1 to 20.</summary>
+    /// <summary>Authorized destination identity initialization budget in seconds, from 15 through 60; defaults to 15 independently of ordinary health reads.</summary>
+    /// <remarks>Applies after acknowledged source logout only, within the outer migration-operation budget. A failed bot identity never proves a shared Local outage or authorizes replaying logout.</remarks>
+    public int DestinationReadinessTimeoutSeconds { get; set; } = 15;
+    /// <summary>Consecutive shared Local root failures needed to declare an outage, from 1 to 20; automatic fallback additionally requires at least fifteen seconds of failure.</summary>
     public int FailureThreshold { get; set; } = 3;
     /// <summary>Consecutive health successes needed for recovery, from 1 to 20.</summary>
     public int RecoveryThreshold { get; set; } = 2;
@@ -52,6 +55,7 @@ public sealed class TelegramEndpointRoutingOptions
             throw new ArgumentException("Local endpoint must be an HTTP loopback origin.");
         Bound(HealthCheckIntervalSeconds, 5, 3600, nameof(HealthCheckIntervalSeconds));
         Bound(HealthCheckTimeoutSeconds, 1, 30, nameof(HealthCheckTimeoutSeconds));
+        Bound(DestinationReadinessTimeoutSeconds, 15, 60, nameof(DestinationReadinessTimeoutSeconds));
         Bound(FailureThreshold, 1, 20, nameof(FailureThreshold));
         Bound(RecoveryThreshold, 1, 20, nameof(RecoveryThreshold));
         Bound(MigrationDrainSeconds, 1, 300, nameof(MigrationDrainSeconds));

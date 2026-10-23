@@ -74,6 +74,7 @@
     "localBaseUrl": "http://127.0.0.1:8081",
     "healthCheckIntervalSeconds": 15,
     "healthCheckTimeoutSeconds": 3,
+    "destinationReadinessTimeoutSeconds": 15,
     "failureThreshold": 3,
     "recoveryThreshold": 2,
     "automaticFailback": false,
