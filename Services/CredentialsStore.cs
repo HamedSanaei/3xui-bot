@@ -22,6 +22,24 @@ public sealed class CredentialsStore
         return await db.Users.AsNoTracking().SingleOrDefaultAsync(x => x.TelegramUserId == credUser);
     }
 
+    /// <summary>Reads at most two global profiles with an exactly matching observed Telegram username.</summary>
+    /// <param name="username">Required canonical ASCII username without @ or a URL, as returned by TelegramUserAccountReference; comparison is case-insensitive.</param>
+    /// <param name="cancellationToken">Cancellation of the local credentials.db read; no external Telegram request is made.</param>
+    /// <returns>Detached profiles ordered by numeric Telegram user id: empty means not found, one is an exact match, two means ambiguous and must not be selected automatically.</returns>
+    /// <remarks>Profiles are shared across bots, just like numeric-id lookup. No profile, balance, role or block flag is changed.
+    /// Usernames are not unique historical identifiers: a stale duplicate fails closed instead of disclosing another user's profile.</remarks>
+    /// <exception cref="ArgumentException">The input is not a canonical username.</exception>
+    /// <example><code>var matches = await store.FindUsersByUsernameAsync("im_Tony2", token); if (matches.Count == 1) { /* Display the authorized admin profile. */ }</code></example>
+    public async Task<List<CredUser>> FindUsersByUsernameAsync(string username, CancellationToken cancellationToken = default)
+    {
+        if (!TelegramUserAccountReference.TryParse(username, out var id, out var normalized) || id != 0 || normalized != username)
+            throw new ArgumentException("A canonical Telegram username is required.", nameof(username));
+        await using var db = _factory.CreateDbContext();
+        return await db.Users.AsNoTracking()
+            .Where(x => EF.Functions.Collate(x.Username, "NOCASE") == username)
+            .OrderBy(x => x.TelegramUserId).Take(2).ToListAsync(cancellationToken);
+    }
+
     /// <summary>Returns a global wallet balance snapshot in toman.</summary>
     /// <param name="credUser">Global Telegram user id.</param>
     /// <returns>Current balance, or the legacy -1 sentinel if the user is absent.</returns>

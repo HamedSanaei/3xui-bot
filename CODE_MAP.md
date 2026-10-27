@@ -1122,6 +1122,15 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - `get_user` HTTP 404 from the Gozargah website means the Telegram user has no website account; wallet-button checks treat it as expected and must not spam the Telegram logger channel.
 - A `delete_order` that hits a missing website order is the desired end state (the order is already absent). `TrySendEventAsync` marks such a delete as skipped instead of leaving it `Failed`, and `SendAsync` suppresses the warning for expected `delete_order`/`update_order` 404 "not found" responses (mirroring the `get_user` exemption). Without this, a stuck/duplicate delete stays `Failed` and the two-minute `GozargahSiteSyncRetryService` resends and re-logs it forever, flooding the logger channel with repeated `Order not found.` messages.
 - Owned-bot profile/status messages should display Gozargah `get_user` 404/not-found as `متصل نشده`, not as the raw HTTP/API error.
+- Owned super-admin **ℹ️ See User Account** accepts a positive numeric Telegram id, bare/@ username or a single-profile
+  HTTP/HTTPS `t.me` URL via `Domain/TelegramUserAccountReference.cs` and `TelegramBotService.UserAccountLookup.cs`.
+  `CredentialsStore.FindUsersByUsernameAsync` performs an exact ASCII-case-insensitive detached credentials.db read
+  capped at two results: historical duplicates require numeric id instead of choosing a private profile arbitrarily.
+  Only observed usernames are searchable (refreshed/cleared by later Telegram interactions); no remote username lookup,
+  schema migration or new authority. Numeric/username results use the same profile renderer, adding
+  `⛔ وضعیت: بلاک` only when global `CredUser.IsBlocked` is true; unblocked profiles have no status line.
+  This is independent of website bans or Telegram reachability.
+  Coverage is in the existing `AdminPanelRoutingTests.cs`; no wallet, order or other bot's conversation is changed.
 - A successful non-banned `get_user` lookup means the owned-bot buyer should be promoted to `CredUser.IsColleague=true` before tariffs, purchases, or renewals are priced.
 - Tenant renewal fulfillment mirrors the purchase `fulfillmentCommitted` boundary: after the atomic users.db commit
   (order fulfilled + ledger + notification intents) any post-commit failure (operation `MarkSettledAsync` or optional

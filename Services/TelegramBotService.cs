@@ -927,6 +927,9 @@ public partial class TelegramBotService
     /// Successful super-admin wallet credits use the committed credentials receipt balance in one combined
     /// plain-text notice per previously started owned bot, without an additional customer profile/credit message.
     /// Funding changes only credit and audit records, not any XUI account's activation or expiry state.
+    /// The legacy See User Account step remains super-admin-only and accepts numeric ids or exact locally observed
+    /// usernames/profile links. Ambiguous historical usernames fail closed; all successful forms share the same profile
+    /// renderer and authoritative global block flag. Lookup completion clears only the requesting bot/user state.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1934,62 +1937,11 @@ public partial class TelegramBotService
             var action = currentUser.LastStep.Split('|')[1];
             if (action == "ℹ️ See User Account")
             {
-                try
-                {
-                    // var userid = Convert.ToInt64(message.Text.Split('|').ElementAt(2));
-                    var userid = Convert.ToInt64(message.Text);
-                    if (userid == 0) throw new Exception("user id is null");
-                    var findedClient = await _credentialsDbContext.GetUserStatusWithId(userid) != null;
-                    // if (!findedClient) await _credentialsDbContext.AddEmptyUser(userid);
-                    // else { }
-                    if (findedClient)
-                    {
-                        CredUser existedUser = await _credentialsDbContext.GetUserStatusWithId(userid);
-                        var text = await GetUserProfileMessage(existedUser);
-                        await botClient.CustomSendTextMessageAsync(
-                            chatId: message.Chat.Id,
-                            text: text,
-                            replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
-
-                    }
-                    else
-                    {
-                        await botClient.CustomSendTextMessageAsync(
-                                                    chatId: message.Chat.Id,
-                                                    text: "User doesn't run the bot yet!. Ask him to first run the bot.",
-                                                    replyMarkup: GetMainMenuKeyboard(), parseMode: ParseMode.Markdown);
-
-
-                    }
-                    await _state.ClearUserStatus(currentUser);
-
-                }
-
-                catch (System.Exception ex)
-                {
-                    string errorMessage;
-                    switch (ex)
-                    {
-                        case ArgumentOutOfRangeException argumentOutOfRangeException:
-                            errorMessage = "There is no userid in Database";
-                            break;
-                        case FormatException formatException:
-                            errorMessage = "There is no userid in Database";
-                            break;
-                        case OverflowException overflowException:
-                            errorMessage = "There is no userid in Database";
-                            break;
-                        default:
-                            errorMessage = ex.Message;
-                            break;
-                    }
-                    await botClient.CustomSendTextMessageAsync(
-                                       chatId: message.Chat.Id,
-                                       text: errorMessage,
-                                       replyMarkup: MainReplyMarkupKeyboardFa(), parseMode: ParseMode.Markdown);
-                    await _state.ClearUserStatus(currentUser);
-
-                }
+                // This branch remains behind the configured super-admin gate. Username lookup grants no new authority.
+                var text = await BuildAdminUserAccountLookupMessageAsync(message.Text, cancellationToken);
+                await _state.ClearUserStatus(currentUser);
+                await botClient.SendMessage(message.Chat.Id, text, replyMarkup: GetMainMenuKeyboard(),
+                    parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
             }
             else if (action == "ℹ️ See All account of user")
             {
@@ -2671,7 +2623,9 @@ public partial class TelegramBotService
                 // baraye ersal payam ya ertegha be admin
                 await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
-                text: "Send User (user must get it from @userinfobot or our bot)",
+                text: message.Text == "ℹ️ See User Account"
+                    ? "آیدی عددی یا یوزرنیم تلگرام کاربر را ارسال کنید.\nمثال: @im_Tony2 یا im_Tony2 یا https://t.me/im_Tony2\nکاربر باید قبلاً با ربات تعامل کرده باشد."
+                    : "Send User (user must get it from @userinfobot or our bot)",
                 replyMarkup: new ReplyKeyboardRemove());
 
                 return;
@@ -8757,11 +8711,12 @@ public partial class TelegramBotService
     /// Lane cancellation token forwarded to the optional Gozargah website wallet lookup. A cancelled lane abandons that
     /// display-only lookup instead of holding the update.
     /// </param>
-    /// <returns>Markdown-escaped profile text, optionally including the website wallet line for colleagues.</returns>
+    /// <returns>Markdown-escaped profile text with a block line only for globally blocked users, optionally including the website wallet line for colleagues; unblocked users have no status line.</returns>
     /// <remarks>
     /// The website wallet line is display-only enrichment. It is bounded by
     /// <see cref="GozargahSiteApiClient.OptionalLookupTimeout" /> and never blocks the profile response beyond that
-    /// budget, and it never debits either wallet.
+    /// budget, and it never debits either wallet. Global credentials IsBlocked is shown independently of colleague role
+    /// and website bans; this means a bot-service block, not an assertion that the user has blocked Telegram delivery.
     /// </remarks>
     async Task<string> GetUserProfileMessage(CredUser credUser, CancellationToken cancellationToken = default)
     {
@@ -8773,6 +8728,8 @@ public partial class TelegramBotService
             text += $"\u200F🆔 آیدی: @{_credUser.Username} \n";
         text += $"\u200Fℹ️ آیدی عددی: `{_credUser.TelegramUserId}` \n";
         text += $"‌💰اعتبار حساب: {_credUser.AccountBalance.FormatCurrency()}\n";
+        if (_credUser.IsBlocked)
+            text += "⛔ وضعیت: بلاک\n";
         if (_credUser.IsColleague)
         {
             text += await BuildGozargahSiteWalletStatusLineAsync(_credUser.TelegramUserId, cancellationToken);

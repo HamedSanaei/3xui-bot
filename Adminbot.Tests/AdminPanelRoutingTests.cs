@@ -20,6 +20,124 @@ using Xunit;
 /// </remarks>
 public sealed class AdminPanelRoutingTests
 {
+    /// <summary>All supported username forms resolve the identical existing numeric-id profile, including its global block status.</summary>
+    /// <param name="reference">Synthetic admin input naming the same previously observed Telegram profile.</param>
+    /// <param name="blocked">Authoritative global service-block flag, independent of Telegram delivery reachability.</param>
+    /// <returns>A task proving identical presentation and no financial/role/block mutation.</returns>
+    [Theory]
+    [InlineData("@im_Tony2", true)]
+    [InlineData("im_Tony2", true)]
+    [InlineData("https://t.me/im_Tony2", true)]
+    [InlineData("https://t.me/IM_tONY2/", true)]
+    [InlineData(" http://t.me/im_Tony2 ", false)]
+    [InlineData("IM_TONY2", false)]
+    public async Task User_account_username_lookup_matches_numeric_profile_and_block_status(string reference, bool blocked)
+    {
+        using var fixture = new Fixture();
+        var credentials = new CredentialsStore(fixture.Credentials);
+        await credentials.GetUserStatus(new CredUser { TelegramUserId = TargetUserId, Username = "im_Tony2", FirstName = "نام [نمونه]" });
+        await credentials.MutateWalletAsync(TargetUserId, 12345, "test:profile-lookup:credit");
+        await credentials.SetBlockedStatus(new[] { TargetUserId }, blocked, SuperAdminId);
+        var probe = BuildProbe(fixture, new[] { SuperAdminId }, credentials: credentials);
+        var numeric = await LookupProfileAsync(probe, TargetUserId.ToString());
+        Assert.Equal(numeric, await LookupProfileAsync(probe, reference));
+        if (blocked) Assert.Contains("⛔ وضعیت: بلاک", numeric);
+        else Assert.DoesNotContain("وضعیت:", numeric);
+        Assert.DoesNotContain("✅ وضعیت: فعال", numeric);
+        Assert.Contains("@im\\_Tony2", numeric);
+        await using var db = fixture.Credentials.CreateDbContext();
+        var stored = await db.Users.AsNoTracking().SingleAsync();
+        Assert.Equal(blocked, stored.IsBlocked);
+        Assert.Equal(12345, stored.AccountBalance);
+        Assert.False(stored.IsColleague);
+        Assert.Single(await db.WalletOperations.ToListAsync());
+    }
+
+    /// <summary>Historical duplicate usernames must never silently select one user's private account profile.</summary>
+    /// <returns>A task proving bounded duplicate results, explicit ambiguity and intact numeric-id lookup.</returns>
+    [Fact]
+    public async Task User_account_duplicate_username_fails_closed_and_numeric_lookup_still_works()
+    {
+        using var fixture = new Fixture();
+        var credentials = new CredentialsStore(fixture.Credentials);
+        foreach (var id in new[] { TargetUserId, OtherUserId, SuperAdminId })
+            await credentials.GetUserStatus(new CredUser { TelegramUserId = id, Username = "im_Tony2", FirstName = "PrivateFixtureName" });
+        var matches = await credentials.FindUsersByUsernameAsync("IM_TONY2");
+        Assert.Equal(2, matches.Count);
+        // Returned snapshots are detached: editing a lookup result cannot update any user's credentials.
+        matches[0].Username = "modified_snapshot";
+        Assert.Equal(2, (await credentials.FindUsersByUsernameAsync("im_Tony2")).Count);
+        var probe = BuildProbe(fixture, new[] { SuperAdminId }, credentials: credentials);
+        var result = await LookupProfileAsync(probe, "@im_Tony2");
+        Assert.Contains("سوابق چند کاربر", result);
+        Assert.DoesNotContain("PrivateFixtureName", result);
+        Assert.Contains(TargetUserId.ToString(), await LookupProfileAsync(probe, TargetUserId.ToString()));
+        await using var db = fixture.Credentials.CreateDbContext();
+        Assert.Equal(3, await db.Users.CountAsync());
+        Assert.Empty(await db.WalletOperations.ToListAsync());
+    }
+
+    /// <summary>Exact local usernames survive a store restart and follow subsequent Telegram profile changes/removal.</summary>
+    /// <returns>A task proving no prefix search, no stale alias fallback and no invented profile on missing references.</returns>
+    [Fact]
+    public async Task User_account_username_lookup_uses_only_current_observed_profile()
+    {
+        using var fixture = new Fixture();
+        var credentials = new CredentialsStore(fixture.Credentials);
+        await credentials.GetUserStatus(new CredUser { TelegramUserId = TargetUserId, Username = "im_Tony2" });
+        var restarted = new CredentialsStore(fixture.Credentials);
+        Assert.Single(await restarted.FindUsersByUsernameAsync("im_Tony2"));
+        Assert.Empty(await restarted.FindUsersByUsernameAsync("im_Tony"));
+        await credentials.GetUserStatus(new CredUser { TelegramUserId = TargetUserId, Username = "new_username" });
+        Assert.Empty(await restarted.FindUsersByUsernameAsync("im_Tony2"));
+        Assert.Single(await restarted.FindUsersByUsernameAsync("NEW_USERNAME"));
+        await credentials.GetUserStatus(new CredUser { TelegramUserId = TargetUserId, Username = string.Empty });
+        Assert.Empty(await restarted.FindUsersByUsernameAsync("new_username"));
+        var probe = BuildProbe(fixture, new[] { SuperAdminId }, credentials: restarted);
+        Assert.Contains("پیدا نشد", await LookupProfileAsync(probe, "@missing_user"));
+        Assert.Contains("پیدا نشد", await LookupProfileAsync(probe, "1234567890"));
+        await using var db = fixture.Credentials.CreateDbContext();
+        Assert.Single(await db.Users.ToListAsync());
+    }
+
+    /// <summary>Malformed/non-profile links, overflow, negative ids and wildcard-like inputs cannot become a profile lookup.</summary>
+    /// <param name="input">Untrusted synthetic message that must be rejected, never sent to Telegram as a resolution request.</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("9223372036854775808")]
+    [InlineData("@@im_Tony2")]
+    [InlineData("im_Tony2 extra")]
+    [InlineData("im%Tony2")]
+    [InlineData("https://example.com/im_Tony2")]
+    [InlineData("https://t.me.evil.example/im_Tony2")]
+    [InlineData("https://t.me/im_Tony2/123")]
+    [InlineData("https://t.me/im_Tony2?start=private")]
+    [InlineData("https://t.me/im_Tony2#private")]
+    [InlineData("https://private@t.me/im_Tony2")]
+    [InlineData("https://t.me:8443/im_Tony2")]
+    [InlineData("https://t.me/%69m_Tony2")]
+    [InlineData("https://t.me/old/../im_Tony2")]
+    [InlineData("https://t.me/@im_Tony2")]
+    [InlineData("tg://resolve?domain=im_Tony2")]
+    [InlineData("im_Tony2\nprivate")]
+    public void User_account_reference_rejects_invalid_or_non_profile_input(string input)
+    {
+        Assert.False(TelegramUserAccountReference.TryParse(input, out var id, out var username));
+        Assert.Equal(0, id);
+        Assert.Null(username);
+    }
+
+    /// <summary>Invokes the actual shared profile builder used by the existing authorized See User Account dispatcher branch.</summary>
+    /// <param name="service">Owned admin service with isolated real credentials and no network collaborators.</param>
+    /// <param name="input">Synthetic numeric id, username or profile URL under test.</param>
+    /// <returns>The same Markdown-escaped profile or fixed lookup notice that the dispatcher sends.</returns>
+    /// <remarks>No Telegram client is involved; existing admin authorization tests independently protect the outer route.</remarks>
+    private static Task<string> LookupProfileAsync(TelegramBotService service, string input)
+        => (Task<string>)typeof(TelegramBotService).GetMethod("BuildAdminUserAccountLookupMessageAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(service, new object[] { input, CancellationToken.None })!;
+
     private const string AdminEntry = "🗽 Admin";
     private const string OldPromoteLabel = "🚀 Promote as admin";
     private const string OldDemoteLabel = "❌ Demote as admin";
