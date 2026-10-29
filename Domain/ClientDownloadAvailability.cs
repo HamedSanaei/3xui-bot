@@ -6,8 +6,9 @@ namespace Adminbot.Domain;
 /// Stable identifiers for the client software download targets offered to customers.
 /// </summary>
 /// <remarks>
-/// The set is compile-time closed. A callback payload can only ever select one of these three values, so no Telegram user
+/// The set is compile-time closed. A release-platform callback can only select one of these three values, so no Telegram user
 /// input can choose a GitHub owner, repository, tag, asset, or arbitrary external URL.
+/// Happ menu navigation is a separate contract and never reaches this resolver enum.
 /// </remarks>
 public enum ClientDownloadPlatform
 {
@@ -21,11 +22,20 @@ public enum ClientDownloadPlatform
     Windows
 }
 
+/// <summary>Closed navigation destinations that do not resolve or download release assets.</summary>
+public enum ClientDownloadMenu
+{
+    /// <summary>The existing Android, iOS and Windows selector plus the Happ entry.</summary>
+    Platforms,
+    /// <summary>The six fixed vendor links for Happ, shared by owned and tenant bots.</summary>
+    Happ
+}
+
 /// <summary>
 /// Shared wire contract for the latest-client-software download menu in owned and tenant bots.
 /// </summary>
 /// <remarks>
-/// Both bot families use these exact constants and this single parser, so a customer sees identical callbacks no matter
+/// Both bot families use these exact constants and closed platform/navigation parsers, so a customer sees identical callbacks no matter
 /// which storefront they are talking to and the two dispatchers cannot drift apart.
 /// </remarks>
 public static class ClientDownloadCallbacks
@@ -35,6 +45,25 @@ public static class ClientDownloadCallbacks
 
     /// <summary>Reply-keyboard label that opens the platform selector.</summary>
     public const string OpenCommand = "📥 دریافت آخرین نسخه نرم‌افزار";
+
+    /// <summary>Opens the fixed Happ submenu without selecting a release-resolver platform.</summary>
+    public const string HappMenuCallback = Prefix + "happ";
+
+    /// <summary>Returns from Happ to the existing software/platform selector.</summary>
+    public const string PlatformMenuCallback = Prefix + "menu";
+
+    /// <summary>Parses only the two fixed submenu-navigation callbacks, independently of release platforms.</summary>
+    /// <param name="data">Untrusted Telegram callback data; null, URLs, suffixes and unknown navigation actions are rejected.</param>
+    /// <param name="menu">Closed navigation destination when true; unspecified when false and must not be used.</param>
+    /// <returns>True only for APPDL:happ or APPDL:menu; no provider or tenant state is accessed.</returns>
+    /// <remarks>Callers must retain live feature/access checks. Navigation never broadens the existing release-platform enum or lets customer input supply a URL.</remarks>
+    /// <example><code>if (ClientDownloadCallbacks.TryParseNavigation(query.Data, out var menu)) { /* Gate and render the shared menu. */ }</code></example>
+    public static bool TryParseNavigation(string data, out ClientDownloadMenu menu)
+    {
+        menu = default;
+        if (data == HappMenuCallback) { menu = ClientDownloadMenu.Happ; return true; }
+        return data == PlatformMenuCallback;
+    }
 
     /// <summary>Message shown when a customer asks for the menu while the feature is globally disabled.</summary>
     /// <remarks>

@@ -97,4 +97,27 @@ public partial class TenantBotService
             platform,
             cancellationToken);
     }
+
+    /// <summary>Renders the shared Happ or parent menu after the current tenant storefront's existing access checks.</summary>
+    /// <param name="botClient">Client of the tenant bot receiving the callback; no cross-bot/default delivery is permitted.</param>
+    /// <param name="callbackQuery">Customer callback recognized by the exact shared navigation parser.</param>
+    /// <param name="menu">Closed Happ or parent destination, not a tenant, repository or arbitrary URL.</param>
+    /// <param name="cancellationToken">Current tenant callback lifetime for acknowledgement and one new menu message.</param>
+    /// <returns>A task after the menu is sent, or a disabled-feature alert with no resolver/provider call.</returns>
+    /// <remarks>The global switch is rechecked after acknowledgement as well as before it. Existing tenant availability,
+    /// owner-block and customer-access routing remain dispatcher-owned; purchase/renewal state and financial data are unchanged.</remarks>
+    private async Task HandleClientDownloadNavigationCallbackAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
+        ClientDownloadMenu menu, CancellationToken cancellationToken)
+    {
+        if (!_clientDownloadAvailability.Snapshot.Enabled)
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, ClientDownloadCallbacks.DisabledMessage,
+                showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
+        if (!_clientDownloadAvailability.Snapshot.Enabled) return;
+        await ClientDownloadFlow.SendNavigationMenuAsync(botClient, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+            menu, cancellationToken);
+    }
 }

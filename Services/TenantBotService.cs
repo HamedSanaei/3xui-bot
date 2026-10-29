@@ -888,6 +888,8 @@ public partial class TenantBotService
     /// Account renewal callbacks are intercepted before the shared XUI dispatcher so tenant customers always create a
     /// tenant-priced order and never enter the owned-wallet flow. State cleanup and UUID target lock remain scoped to the
     /// current tenant bot plus Telegram user; no other bot's state is read or changed.
+    /// Happ/parent download navigation uses the same shared menu as owned bots and the live global download switch;
+    /// it renders fixed vendor links without invoking a release resolver or changing purchase/renewal state.
     /// </remarks>
     /// <example>
     /// <code>
@@ -979,8 +981,13 @@ public partial class TenantBotService
             }
 
             // Latest-client-software downloads share one callback namespace with the owned bot so both storefront
-            // families behave identically. Only the three compile-time platforms can be selected, and the handler
-            // re-checks the live global switch so a stale inline button fails closed without contacting GitHub.
+            // families behave identically. Three release platforms and two fixed navigation actions are accepted;
+            // handlers re-check the live global switch before rendering or contacting GitHub.
+            if (ClientDownloadCallbacks.TryParseNavigation(CallbackQuery.Data, out var downloadMenu))
+            {
+                await HandleClientDownloadNavigationCallbackAsync(botClient, CallbackQuery, downloadMenu, CancellationToken);
+                return true;
+            }
             if (ClientDownloadCallbacks.TryParse(CallbackQuery.Data, out var downloadPlatform))
             {
                 await HandleClientDownloadPlatformCallbackAsync(botClient, CallbackQuery, downloadPlatform, CancellationToken);

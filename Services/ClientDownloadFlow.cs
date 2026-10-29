@@ -16,7 +16,7 @@ namespace Adminbot.Services;
 /// only, and never touches orders, payments, wallets, tenants, panel state, or conversation state.
 /// </para>
 /// <para>
-/// Every entry point re-checks the live global switch before doing work, and the release resolution is read-only. Nothing
+/// The owning dispatcher re-checks the live global switch before calling these renderers, and release resolution is read-only. Nothing
 /// here can unblock a purchase, renewal, or settlement path.
 /// </para>
 /// </remarks>
@@ -41,8 +41,8 @@ internal static class ClientDownloadFlow
     /// <param name="cancellationToken">Cancellation token for the Telegram send.</param>
     /// <returns>A task that completes after the selector message is sent.</returns>
     /// <remarks>
-    /// The inline buttons carry only the three compile-time platform payloads, so no customer input can influence which
-    /// repository, tag, asset, or URL is resolved.
+    /// The inline buttons carry three compile-time platform payloads and the fixed Happ-menu action. No customer input can
+    /// influence the repository, tag, asset or URL; Happ does not enter the existing platform release resolver.
     /// </remarks>
     internal static Task SendPlatformMenuAsync(
         ITelegramBotClient botClient,
@@ -59,14 +59,43 @@ internal static class ClientDownloadFlow
                 ClientDownloadCallbacks.Build(ClientDownloadPlatform.Ios)) },
             new[] { InlineKeyboardButton.WithCallbackData(
                 ClientDownloadCallbacks.GetButtonLabel(ClientDownloadPlatform.Windows),
-                ClientDownloadCallbacks.Build(ClientDownloadPlatform.Windows)) }
+                ClientDownloadCallbacks.Build(ClientDownloadPlatform.Windows)) },
+            new[] { InlineKeyboardButton.WithCallbackData("📲 Happ", ClientDownloadCallbacks.HappMenuCallback) }
         };
 
         return botClient.SendMessage(
             chatId,
-            "📲 دریافت آخرین نسخه نرم‌افزار\nسیستم‌عامل خود را انتخاب کنید:",
+            "📲 دریافت آخرین نسخه نرم‌افزار\nنرم‌افزار یا سیستم‌عامل موردنظر را انتخاب کنید:",
             replyMarkup: new InlineKeyboardMarkup(rows),
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>Sends a new navigation message containing either the shared Happ links or the original software selector.</summary>
+    /// <param name="botClient">Client of the current owned or tenant bot; never a default-bot fallback.</param>
+    /// <param name="chatId">Telegram chat that initiated the already acknowledged callback.</param>
+    /// <param name="menu">Closed parsed destination, accepted only after the caller's live feature/access checks.</param>
+    /// <param name="cancellationToken">Current callback lifetime for the Telegram send.</param>
+    /// <returns>A task completing after one new message; no release lookup, upload, download or database write occurs.</returns>
+    /// <remarks>The six Happ destinations are fixed vendor URLs supplied by the catalog owner. GitHub latest/download links
+    /// are left verbatim, so the vendor selects the release when clicked; no pinned version or speculative architecture is inferred.</remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The destination is not a defined navigation menu.</exception>
+    /// <example><code>await ClientDownloadFlow.SendNavigationMenuAsync(botClient, chatId, ClientDownloadMenu.Happ, token);</code></example>
+    internal static Task SendNavigationMenuAsync(ITelegramBotClient botClient, ChatId chatId,
+        ClientDownloadMenu menu, CancellationToken cancellationToken)
+    {
+        if (menu == ClientDownloadMenu.Platforms) return SendPlatformMenuAsync(botClient, chatId, cancellationToken);
+        if (menu != ClientDownloadMenu.Happ) throw new ArgumentOutOfRangeException(nameof(menu));
+        return botClient.SendMessage(chatId, "📲 دریافت Happ\nنسخه مناسب دستگاه خود را انتخاب کنید:",
+            replyMarkup: new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithUrl("🤖 اندروید", "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk") },
+                new[] { InlineKeyboardButton.WithUrl("🪟 ویندوز — x64", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe") },
+                new[] { InlineKeyboardButton.WithUrl("🍎 مک‌اواس", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215?platform=mac") },
+                new[] { InlineKeyboardButton.WithUrl("🐧 لینوکس — deb، x64", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.deb") },
+                new[] { InlineKeyboardButton.WithUrl("📺 اپل تی‌وی", "https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274") },
+                new[] { InlineKeyboardButton.WithUrl("📺 اندروید تی‌وی", "https://play.google.com/store/apps/details?id=com.happproxy") },
+                new[] { InlineKeyboardButton.WithCallbackData("↩️ بازگشت به نرم‌افزارها", ClientDownloadCallbacks.PlatformMenuCallback) }
+            }), cancellationToken: cancellationToken);
     }
 
     /// <summary>

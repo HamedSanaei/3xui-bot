@@ -919,6 +919,8 @@ public partial class TelegramBotService
     /// handlers after the transient reset.
     /// Owned installation callbacks use the shared built-in tenant image albums and acknowledge before upload;
     /// tutorial platform/parent navigation never clears the requesting bot/user's active conversation.
+    /// Download navigation accepts fixed Happ/parent callbacks behind existing access gates and the live download switch;
+    /// six vendor links are rendered without release-provider requests or purchase/renewal state changes.
     /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
     /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
     /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
@@ -1100,6 +1102,11 @@ public partial class TelegramBotService
 
             // Latest-client-software downloads are a global feature shared with tenant storefronts. The callback is
             // routed before the legacy payment/admin dispatcher so the owned flow never mistakes it for a payment action.
+            if (ClientDownloadCallbacks.TryParseNavigation(callbackQuery.Data, out var downloadMenu))
+            {
+                await HandleClientDownloadNavigationCallbackAsync(botClient, callbackQuery, downloadMenu, cancellationToken);
+                return;
+            }
             if (ClientDownloadCallbacks.TryParse(callbackQuery.Data, out var downloadPlatform))
             {
                 await HandleClientDownloadPlatformCallbackAsync(botClient, callbackQuery, downloadPlatform, cancellationToken);

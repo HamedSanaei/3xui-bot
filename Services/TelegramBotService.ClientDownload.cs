@@ -105,6 +105,29 @@ public partial class TelegramBotService
             cancellationToken);
     }
 
+    /// <summary>Opens Happ or returns to software selection in the current owned bot without release-provider traffic.</summary>
+    /// <param name="botClient">Client of the owned bot that received the callback.</param>
+    /// <param name="callbackQuery">Customer callback already recognized by the closed navigation parser.</param>
+    /// <param name="menu">Parsed Happ or platform-menu destination; never a tenant id or external URL.</param>
+    /// <param name="cancellationToken">Current callback lifetime for acknowledgement and rendering.</param>
+    /// <returns>A task after acknowledgement and one shared menu send, or a disabled-feature alert with no submenu.</returns>
+    /// <remarks>Existing dispatcher access policies still apply. Live availability is checked both before and after acknowledgement,
+    /// so disabling while the acknowledgement is in flight cannot expose a fresh menu. Purchase/renewal state and wallets are untouched.</remarks>
+    private async Task HandleClientDownloadNavigationCallbackAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery,
+        ClientDownloadMenu menu, CancellationToken cancellationToken)
+    {
+        if (!_clientDownloadAvailability.Snapshot.Enabled)
+        {
+            await SafeAnswerCallbackQueryAsync(callbackQuery.Id, ClientDownloadCallbacks.DisabledMessage,
+                showAlert: true, cancellationToken: cancellationToken);
+            return;
+        }
+        await SafeAnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+        if (!_clientDownloadAvailability.Snapshot.Enabled) return;
+        await ClientDownloadFlow.SendNavigationMenuAsync(botClient, callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
+            menu, cancellationToken);
+    }
+
     /// <summary>
     /// Sends the global latest-client-download switch panel to an authenticated super-admin.
     /// </summary>

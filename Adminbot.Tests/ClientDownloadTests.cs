@@ -40,6 +40,120 @@ using File = System.IO.File;
 /// </remarks>
 public sealed partial class ConcurrencyTests
 {
+    /// <summary>Happ navigation is a separate closed callback contract and cannot select arbitrary URLs or release platforms.</summary>
+    /// <param name="payload">Synthetic customer callback, including crafted values.</param>
+    /// <param name="expected">Whether the exact navigation action must be accepted.</param>
+    [Theory]
+    [InlineData("APPDL:happ", true)]
+    [InlineData("APPDL:menu", true)]
+    [InlineData("APPDL:happ:android", false)]
+    [InlineData("APPDL:menu:extra", false)]
+    [InlineData("APPDL:https://example.com", false)]
+    [InlineData("APPDL:android", false)]
+    [InlineData("APPDL:windows", false)]
+    [InlineData("APPDL:ios", false)]
+    [InlineData("APPDL:HAPP", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void Happ_navigation_parser_is_closed_and_separate(string? payload, bool expected)
+    {
+        Assert.Equal(expected, ClientDownloadCallbacks.TryParseNavigation(payload!, out var menu));
+        if (!expected) return;
+        Assert.Equal(payload == "APPDL:happ" ? ClientDownloadMenu.Happ : ClientDownloadMenu.Platforms, menu);
+        Assert.False(ClientDownloadCallbacks.TryParse(payload!, out _));
+    }
+
+    /// <summary>Both storefront families send identical six-link Happ menus without invoking the existing release resolver or uploading files.</summary>
+    /// <param name="tenant">True exercises the tenant handler; false exercises the owned handler.</param>
+    /// <returns>A task after exact URLs, labels, acknowledgement and parent navigation are verified.</returns>
+    /// <remarks>All Telegram requests are captured in memory; no vendor HTTP or real customer state is touched.</remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Happ_submenu_links_and_back_navigation_are_identical_for_owned_and_tenant(bool tenant)
+    {
+        using var databases = new Databases();
+        var flag = new ClientDownloadAvailabilityProbe(enabled: true);
+        var releases = new CountingReleaseService();
+        var client = new GatewayTelegramClient();
+        object service = tenant ? BuildClientDownloadTenantService(databases, flag, releases)
+            : BuildClientDownloadTelegramService(databases, flag, releases, client);
+        await InvokeDownloadNavigationAsync(service, client, "APPDL:happ");
+        var message = Assert.Single(client.Sends);
+        Assert.Contains("Happ", message.Text);
+        var buttons = ((InlineKeyboardMarkup)message.ReplyMarkup!).InlineKeyboard.SelectMany(row => row).ToArray();
+        Assert.Equal(new[]
+        {
+            "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk",
+            "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+            "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215?platform=mac",
+            "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.deb",
+            "https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274",
+            "https://play.google.com/store/apps/details?id=com.happproxy"
+        }, buttons.Take(6).Select(button => button.Url));
+        Assert.Equal(new[] { "🤖 اندروید", "🪟 ویندوز — x64", "🍎 مک‌اواس", "🐧 لینوکس — deb، x64", "📺 اپل تی‌وی", "📺 اندروید تی‌وی" },
+            buttons.Take(6).Select(button => button.Text));
+        Assert.Equal(7, buttons.Length);
+        Assert.Equal("↩️ بازگشت به نرم‌افزارها", buttons[^1].Text);
+        Assert.Equal("APPDL:menu", buttons[^1].CallbackData);
+        Assert.Single(client.Answers);
+        await InvokeDownloadNavigationAsync(service, client, buttons[^1].CallbackData!);
+        Assert.Equal(2, client.Sends.Count); // Navigation sends a new message; it never edits or replays the old card.
+        var parent = (InlineKeyboardMarkup)client.Sends[^1].ReplyMarkup!;
+        Assert.Equal(new[] { "APPDL:android", "APPDL:ios", "APPDL:windows", "APPDL:happ" },
+            parent.InlineKeyboard.SelectMany(row => row).Select(button => button.CallbackData));
+        Assert.Equal(0, releases.Calls);
+        Assert.Empty(client.Documents);
+        Assert.Empty(client.EditAttempts);
+    }
+
+    /// <summary>Old Happ/back buttons fail closed in both bot families after the live global feature is disabled.</summary>
+    /// <param name="tenant">Whether the current bot is tenant rather than owned.</param>
+    /// <param name="payload">Previously generated Happ or back-navigation callback.</param>
+    /// <returns>A task proving no menu, document or release lookup is produced while disabled.</returns>
+    [Theory]
+    [InlineData(false, "APPDL:happ")]
+    [InlineData(true, "APPDL:happ")]
+    [InlineData(false, "APPDL:menu")]
+    [InlineData(true, "APPDL:menu")]
+    public async Task Happ_stale_navigation_rechecks_the_global_switch(bool tenant, string payload)
+    {
+        using var databases = new Databases();
+        var flag = new ClientDownloadAvailabilityProbe(enabled: true);
+        var releases = new CountingReleaseService();
+        var client = new GatewayTelegramClient();
+        object service = tenant ? BuildClientDownloadTenantService(databases, flag, releases)
+            : BuildClientDownloadTelegramService(databases, flag, releases, client);
+        await InvokeDownloadNavigationAsync(service, client, "APPDL:happ");
+        client.Sends.Clear();
+        client.Answers.Clear();
+        flag.SetEnabled(false);
+        await InvokeDownloadNavigationAsync(service, client, payload);
+        Assert.Empty(client.Sends);
+        var answer = Assert.Single(client.Answers);
+        Assert.True(answer.ShowAlert);
+        Assert.Equal(ClientDownloadCallbacks.DisabledMessage, answer.Text);
+        Assert.Equal(0, releases.Calls);
+        Assert.Empty(client.Documents);
+    }
+
+    /// <summary>Invokes one production navigation handler with a synthetic parsed callback and an in-memory Telegram transport.</summary>
+    /// <param name="service">Owned or tenant service built with isolated scratch databases.</param>
+    /// <param name="client">Capture-only Telegram client bound to the current bot.</param>
+    /// <param name="payload">An exact Happ or parent callback; arbitrary payloads must fail the parser first.</param>
+    /// <returns>A task after acknowledgement/rendering, without running hosted workers or external network requests.</returns>
+    private static async Task InvokeDownloadNavigationAsync(object service, ITelegramBotClient client, string payload)
+    {
+        Assert.True(ClientDownloadCallbacks.TryParseNavigation(payload, out var menu));
+        var query = new CallbackQuery
+        {
+            Id = "happ-navigation", From = new TelegramUser { Id = 4242 }, Data = payload,
+            Message = new Message { Id = 7, Chat = new Chat { Id = 4242 } }
+        };
+        await (Task)service.GetType().GetMethod("HandleClientDownloadNavigationCallbackAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(service, new object[] { client, query, menu, CancellationToken.None })!;
+    }
+
     // ---------------------------------------------------------------------------------------------------------------
     // Release selection
     // ---------------------------------------------------------------------------------------------------------------
@@ -758,18 +872,22 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// With the feature enabled the owned bot must answer a genuine menu request with the three platform buttons.
+    /// With the feature enabled both bot families answer a genuine menu request with the existing platforms and Happ in stable order.
     /// </summary>
-    [Fact]
-    public async Task Enabled_owned_menu_request_offers_the_three_platforms()
+    /// <param name="tenant">Whether to exercise the tenant menu instead of the owned menu.</param>
+    /// <returns>A task proving the shared parent menu preserves existing callbacks and appends only Happ.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Enabled_download_menu_request_offers_existing_platforms_and_Happ(bool tenant)
     {
         using var databases = new Databases();
         var flag = new ClientDownloadAvailabilityProbe(enabled: true);
         var releases = new CountingReleaseService();
         var client = new GatewayTelegramClient();
-        var service = BuildClientDownloadTelegramService(databases, flag, releases, client);
-
-        var handled = await InvokeOwnedMenuRequestAsync(service, client, ClientDownloadCallbacks.OpenCommand);
+        var handled = tenant
+            ? await InvokeTenantMenuRequestAsync(BuildClientDownloadTenantService(databases, flag, releases), client, ClientDownloadCallbacks.OpenCommand)
+            : await InvokeOwnedMenuRequestAsync(BuildClientDownloadTelegramService(databases, flag, releases, client), client, ClientDownloadCallbacks.OpenCommand);
 
         Assert.True(handled);
         var sent = Assert.Single(client.Sends);
@@ -777,7 +895,7 @@ public sealed partial class ConcurrencyTests
             .SelectMany(row => row)
             .Select(button => button.CallbackData)
             .ToList();
-        Assert.Equal(new[] { "APPDL:android", "APPDL:ios", "APPDL:windows" }, callbacks);
+        Assert.Equal(new[] { "APPDL:android", "APPDL:ios", "APPDL:windows", "APPDL:happ" }, callbacks);
         Assert.Equal(0, releases.Calls);
     }
 
