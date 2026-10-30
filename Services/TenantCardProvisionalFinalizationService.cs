@@ -128,6 +128,8 @@ namespace Adminbot.Services
     /// write, enable), which the contract tests prove value-idempotent, so an ambiguous replay converges instead of
     /// compounding. Identity is re-proven before the first mutation, and a mismatch fails closed into manual review
     /// instead of mutating a client that may belong to someone else.
+    /// Explicitly reviewed recovery is stricter: a pending mutation marker permits GET-only reconciliation,
+    /// and a proven delivery awaiting settlement never clears subsequently accrued purchased usage.
     /// </para>
     /// </remarks>
     public sealed class TenantCardProvisionalFinalizationService
@@ -180,6 +182,9 @@ namespace Adminbot.Services
         /// <see cref="TenantCardProvisionalFinalizationStatus.AlreadyFinalized" /> without issuing any mutation, so a
         /// duplicate approval callback cannot reset traffic again, extend the expiry, rewrite the quota, or create a
         /// second client.
+        /// Reviewed recovery additionally uses NoAutomaticRetry transport and durable pre-dispatch markers.
+        /// Once reviewed delivery is proven, retries only re-read identity, placement and frozen entitlement;
+        /// nonzero purchased usage is legitimate and must not be cleared for financial retry.
         /// </remarks>
         public async Task<TenantCardProvisionalFinalizationResult> FinalizeAsync(
             TenantCardProvisionalFinalizationRequest request,
@@ -212,6 +217,23 @@ namespace Adminbot.Services
                 cancellationToken).ConfigureAwait(false);
             var quotaBytes = frozen.FinalQuotaBytes ?? request.PurchasedQuotaBytes;
             var expiryTimeMs = frozen.FinalExpiryTimeMs ?? ComputeFrozenExpiry(DateTime.UtcNow, request.PurchasedDurationDays);
+            if (claim.Operation.ReviewedRecoveryId.HasValue &&
+                (request.PurchasedQuotaBytes != quotaBytes || frozen.FinalizationEffectiveAtUtc == null ||
+                 Math.Abs((decimal)ComputeFrozenExpiry(frozen.FinalizationEffectiveAtUtc.Value, request.PurchasedDurationDays) - expiryTimeMs) > 2000))
+                return await ManualReviewAsync(operationKey, "provisional_review_catalog_entitlement_changed", cancellationToken).ConfigureAwait(false);
+
+            // A reviewed crash/timeout has an explicit mutation marker. Only GET proof may resolve it;
+            // never repeat an uncertain mutation. After proven delivery, purchased usage must never be reset on settlement retry.
+            if (claim.Operation.ReviewedRecoveryId.HasValue &&
+                (claim.Operation.MutationPending || step == TenantCardProvisionalSteps.Proven))
+            {
+                var proof = await ProveFinalStateAsync(request, quotaBytes, expiryTimeMs, cancellationToken,
+                    requireZeroCounters: step != TenantCardProvisionalSteps.Proven).ConfigureAwait(false);
+                if (!proof.Proven)
+                    return await ManualReviewAsync(operationKey, proof.ReasonCode, cancellationToken).ConfigureAwait(false);
+                await _store.AdvanceAsync(operationKey, TenantCardProvisionalSteps.Proven, proof.Evidence, cancellationToken).ConfigureAwait(false);
+                return Result(TenantCardProvisionalFinalizationStatus.AlreadyFinalized, operationKey, TenantCardProvisionalSteps.Proven, null);
+            }
 
             // An already-proven saga is never re-mutated; it only re-reads and re-proves. Usage that appeared after the
             // quota write is still erased rather than absorbed, because erasing it grants nothing: the quota is already
@@ -406,8 +428,13 @@ namespace Adminbot.Services
             if (clientProbe.Client.Enable)
                 return StepProbe.Success(Evidence("identity", "matched", "enable", "true", "mutation", "none"));
 
-            var enableResponse = await ApiServicev3.SetClientEnabledAsync(
-                request.ServerInfo, _configuration, request.ExpectedEmail, true, cancellationToken).ConfigureAwait(false);
+            await _store.MarkMutationStartedAsync(BuildOperationKey(request.OrderId), "enable", cancellationToken).ConfigureAwait(false);
+            var retryMode = await MutationRetryModeAsync(request, cancellationToken).ConfigureAwait(false);
+            clientProbe.Client.Enable = true;
+            var enableResponse = retryMode == XuiV3RequestRetryMode.NoAutomaticRetry
+                ? await ApiServicev3.UpdateClientAsync(request.ServerInfo, _configuration, request.ExpectedEmail,
+                    clientProbe.Client, cancellationToken, retryMode).ConfigureAwait(false)
+                : await ApiServicev3.SetClientEnabledAsync(request.ServerInfo, _configuration, request.ExpectedEmail, true, cancellationToken).ConfigureAwait(false);
 
             if (!IsSuccess(enableResponse))
                 return StepProbe.Transport("provisional_enable_request_failed");
@@ -457,8 +484,10 @@ namespace Adminbot.Services
 
             if (!alreadyCleared)
             {
+                await _store.MarkMutationStartedAsync(BuildOperationKey(request.OrderId), "reset", cancellationToken).ConfigureAwait(false);
                 var resetResponse = await ApiServicev3.ResetClientTrafficAsync(
-                    request.ServerInfo, _configuration, request.ExpectedEmail, cancellationToken).ConfigureAwait(false);
+                    request.ServerInfo, _configuration, request.ExpectedEmail, cancellationToken,
+                    await MutationRetryModeAsync(request, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
 
                 if (!IsSuccess(resetResponse))
                     return StepProbe.Transport("provisional_reset_request_failed");
@@ -496,8 +525,10 @@ namespace Adminbot.Services
 
             if (before.Traffic.Up != 0 || before.Traffic.Down != 0)
             {
+                await _store.MarkMutationStartedAsync(BuildOperationKey(request.OrderId), "zero", cancellationToken).ConfigureAwait(false);
                 var response = await ApiServicev3.UpdateClientTrafficAsync(
-                    request.ServerInfo, _configuration, request.ExpectedEmail, 0, 0, cancellationToken).ConfigureAwait(false);
+                    request.ServerInfo, _configuration, request.ExpectedEmail, 0, 0, cancellationToken,
+                    await MutationRetryModeAsync(request, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
 
                 if (!IsSuccess(response))
                     return StepProbe.Transport("provisional_counter_clear_failed");
@@ -549,8 +580,10 @@ namespace Adminbot.Services
                 client.ExpiryTime = expiryTimeMs;
                 client.Enable = true;
 
+                await _store.MarkMutationStartedAsync(BuildOperationKey(request.OrderId), "quota", cancellationToken).ConfigureAwait(false);
                 var response = await ApiServicev3.UpdateClientAsync(
-                    request.ServerInfo, _configuration, request.ExpectedEmail, client, cancellationToken).ConfigureAwait(false);
+                    request.ServerInfo, _configuration, request.ExpectedEmail, client, cancellationToken,
+                    await MutationRetryModeAsync(request, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
 
                 if (!IsSuccess(response))
                     return StepProbe.Transport("provisional_final_quota_write_failed");
@@ -624,9 +657,10 @@ namespace Adminbot.Services
         /// <param name="quotaBytes">Frozen exact purchased quota in bytes.</param>
         /// <param name="expiryTimeMs">Frozen absolute expiry, or <c>0</c> for a lifetime order.</param>
         /// <param name="cancellationToken">Cancellation token for panel I/O.</param>
+        /// <param name="requireZeroCounters">True before first delivery proof; false only for an already proven reviewed delivery whose purchased usage must not be erased during settlement retry.</param>
         /// <returns>
         /// A probe whose <c>Proven</c> flag is set only when quota, expiry, enable state, identity, placement, and zero
-        /// provisional usage are all proven at once.
+        /// provisional usage are all proven at once, unless requireZeroCounters is false for an already proven reviewed delivery.
         /// </returns>
         /// <remarks>
         /// This read-back is the boundary the caller's settlement tail must gate on. It re-reads rather than trusting the
@@ -636,7 +670,7 @@ namespace Adminbot.Services
             TenantCardProvisionalFinalizationRequest request,
             long quotaBytes,
             long expiryTimeMs,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken, bool requireZeroCounters = true)
         {
             var clientProbe = await ReadClientAsync(request, cancellationToken).ConfigureAwait(false);
             if (!clientProbe.Proven)
@@ -661,7 +695,7 @@ namespace Adminbot.Services
 
             // The purchased allowance must start from zero usage. It is never inflated to absorb provisional usage, which
             // is why a non-zero counter escalates to a bounded re-clear and then to manual review.
-            if (trafficProbe.Traffic.Up != 0 || trafficProbe.Traffic.Down != 0)
+            if (requireZeroCounters && (trafficProbe.Traffic.Up != 0 || trafficProbe.Traffic.Down != 0))
                 return StepProbe.FailClosed(FinalizationReasonCodes.CountersNotQuiescent);
 
             return StepProbe.Success(Evidence(
@@ -672,6 +706,15 @@ namespace Adminbot.Services
                 "up", trafficProbe.Traffic.Up.ToString(CultureInfo.InvariantCulture),
                 "down", trafficProbe.Traffic.Down.ToString(CultureInfo.InvariantCulture)));
         }
+
+        /// <summary>Selects the non-replayable transport boundary for explicitly reviewed recoveries.</summary>
+        /// <param name="request">Saved finalize order identity, not user text.</param>
+        /// <param name="cancellationToken">Durable saga read cancellation before dispatch.</param>
+        /// <returns>NoAutomaticRetry for reviewed recovery; the legacy idempotent policy otherwise.</returns>
+        /// <remarks>Every reviewed mutation has a durable pending marker; later attempts may only GET-reconcile an uncertain dispatch.</remarks>
+        private async Task<XuiV3RequestRetryMode> MutationRetryModeAsync(TenantCardProvisionalFinalizationRequest request, CancellationToken cancellationToken)
+            => (await _store.FindAsync(BuildOperationKey(request.OrderId), cancellationToken).ConfigureAwait(false))?.ReviewedRecoveryId != null
+                ? XuiV3RequestRetryMode.NoAutomaticRetry : XuiV3RequestRetryMode.IdempotentMutation;
 
         /// <summary>Reads the panel client and converts transport failures into a retryable probe.</summary>
         /// <param name="request">Authoritative panel connection.</param>
@@ -724,8 +767,7 @@ namespace Adminbot.Services
             if (!string.Equals(client.Uuid, request.ExpectedUuid, StringComparison.Ordinal))
                 return StepProbe.FailClosed("provisional_identity_uuid_mismatch");
 
-            if (!string.IsNullOrEmpty(request.ExpectedSubId)
-                && !string.Equals(client.SubId, request.ExpectedSubId, StringComparison.Ordinal))
+            if (!string.Equals(client.SubId ?? "", request.ExpectedSubId ?? "", StringComparison.Ordinal))
                 return StepProbe.FailClosed("provisional_identity_subid_mismatch");
 
             if (request.ExpectedInboundIds.Count > 0)

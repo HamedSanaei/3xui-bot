@@ -61,6 +61,8 @@ public class UserDbContext : DbContext
     public DbSet<ColleagueTrialGrant> ColleagueTrialGrants { get; set; }
     /// <summary>Restart-safe step state for tenant card-to-card provisional finalize and revoke sagas.</summary>
     public DbSet<TenantCardProvisionalOperation> TenantCardProvisionalOperations { get; set; }
+    /// <summary>Persistent actor/bot-bound provisional recovery approvals; audit only, never a source of payment credit.</summary>
+    public DbSet<TenantCardProvisionalReview> TenantCardProvisionalReviews { get; set; }
     public DbSet<BotInstance> BotInstances { get; set; }
     public DbSet<BotUserState> BotUserStates { get; set; }
     // Tenant storefront state stays in users.db; credentials.db owns global profiles, balances, and wallet receipts.
@@ -226,6 +228,16 @@ public class UserDbContext : DbContext
             // Recovery scans for in-flight sagas, so index the order link and the terminal-step filter helper.
             entity.HasIndex(x => x.TenantBotOrderId);
             entity.HasIndex(x => new { x.Step, x.UpdatedAtUtc });
+        });
+        modelBuilder.Entity<TenantCardProvisionalReview>(entity =>
+        {
+            // Logical references deliberately retain the complete review history instead of cascading deletion.
+            entity.HasKey(x => x.Id);
+            entity.HasIndex(x => new { x.TenantBotOrderId, x.CreatedAtUtc });
+            entity.HasIndex(x => new { x.Status, x.ExpiresAtUtc });
+            entity.Property(x => x.OperationKey).IsRequired().HasMaxLength(240);
+            entity.Property(x => x.BindingHash).IsRequired().HasMaxLength(64);
+            entity.Property(x => x.SnapshotHash).IsRequired().HasMaxLength(64);
         });
         modelBuilder.Entity<TelegramUpdateInboxEntry>(entity =>
         {

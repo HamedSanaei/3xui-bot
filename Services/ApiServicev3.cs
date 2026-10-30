@@ -1697,6 +1697,7 @@ public class ApiServicev3
     /// exists, so a detached email cannot be reset.
     /// </param>
     /// <param name="cancellationToken">Token that cancels the external request.</param>
+    /// <param name="retryMode">Explicit mutation retry contract; reviewed provisional recovery passes NoAutomaticRetry because a timeout may hide a committed reset.</param>
     /// <returns>
     /// The panel response. A success means the panel already disabled-and-re-enabled bookkeeping; callers must still
     /// read the client back before treating any derived state as settled.
@@ -1734,8 +1735,9 @@ public class ApiServicev3
     /// // Up == 0 and Down == 0 prove counters were cleared; the client is enabled by contract.
     /// </code>
     /// </example>
-    public static Task<XuiV3ApiResponse<JToken>> ResetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
-        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/resetTraffic/{EscapePath(email)}", null, true, cancellationToken);
+    public static Task<XuiV3ApiResponse<JToken>> ResetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default,
+        XuiV3RequestRetryMode retryMode = XuiV3RequestRetryMode.IdempotentMutation)
+        => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, $"/panel/api/clients/resetTraffic/{EscapePath(email)}", null, true, cancellationToken, retryMode: retryMode);
 
     /// <summary>POST /panel/api/clients/bulkResetTraffic. Resets traffic for many clients.</summary>
     public static Task<XuiV3ApiResponse<JToken>> BulkResetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, IEnumerable<string> emails, CancellationToken cancellationToken = default)

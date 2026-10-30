@@ -62,6 +62,20 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
 
     /// <summary>Gets the number of counter writes observed.</summary>
     public int CounterWriteRequestCount { get; private set; }
+    /// <summary>Total POST attempts, including unsupported create calls, for read-only/no-duplicate assertions.</summary>
+    public int TotalPostCount { get; private set; }
+    /// <summary>Test-only transport outage for GET requests; mutations and stored client state are untouched.</summary>
+    public bool FailReads { get; set; }
+    /// <summary>Test-only ambiguous update: commit the payload but answer 503, requiring GET-only recovery.</summary>
+    public bool FailUpdateAfterCommit { get; set; }
+    /// <summary>Optional synthetic race hook after a traffic observation; used only to test live configuration changes.</summary>
+    public Action? AfterTrafficRead { get; set; }
+
+    /// <summary>Simulates purchased usage accruing after panel success but before settlement retry.</summary>
+    /// <param name="email">Existing fake client's exact email.</param><param name="up">Nonnegative uploaded bytes.</param>
+    /// <param name="down">Nonnegative downloaded bytes.</param>
+    public void SetSharedTraffic(string email, long up, long down)
+    { lock (_sync) { _clients[email]["up"] = up; _clients[email]["down"] = down; } }
 
     /// <summary>
     /// Gets the number of times a request changed a client's enable flag.
@@ -292,10 +306,13 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
     private async Task HandleAsync(HttpContext context)
     {
         var path = context.Request.Path.Value ?? string.Empty;
+        if (context.Request.Method == "GET" && FailReads)
+        { context.Response.StatusCode = 503; return; }
         var email = Uri.UnescapeDataString(path[(path.LastIndexOf('/') + 1)..]);
 
         if (context.Request.Method == "POST")
         {
+            TotalPostCount++;
             var body = await new StreamReader(context.Request.Body).ReadToEndAsync();
             LastRawBody = body;
 
@@ -387,6 +404,7 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
                     }
                 }
 
+                if (FailUpdateAfterCommit) { context.Response.StatusCode = 503; return; }
                 await WriteSuccessAsync(context, new JObject());
                 return;
             }
@@ -397,7 +415,9 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
 
         if (path.Contains("/traffic/", StringComparison.OrdinalIgnoreCase))
         {
-            await WriteSuccessAsync(context, BuildTrafficView(email));
+            var traffic = BuildTrafficView(email);
+            AfterTrafficRead?.Invoke();
+            await WriteSuccessAsync(context, traffic);
             return;
         }
 

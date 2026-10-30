@@ -8,13 +8,13 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace Adminbot.Migrations
 {
-    /// <summary>Current users.db migration model, including identity-scoped endpoint control and incident-only logger-channel alerts.</summary>
+    /// <summary>Current users.db model including additive provisional reviewed-recovery audit and mutation-boundary fields.</summary>
     [DbContext(typeof(UserDbContext))]
     partial class UserDbContextModelSnapshot : ModelSnapshot
     {
-        /// <summary>Describes the latest users.db schema for additive migration comparisons.</summary>
-        /// <param name="modelBuilder">The EF Core migration model builder.</param>
-        /// <remarks>Endpoint states isolate BotId plus BotFather identity. Append-only history and compact permanent incident receipts have no financial or cascading foreign-key effects.</remarks>
+        /// <summary>Describes current schema for future additive migration comparisons.</summary>
+        /// <param name="modelBuilder">EF model builder; no data reads, approvals or financial effects occur.</param>
+        /// <remarks>Review/order/saga references are logical, without cascading audit deletion or historical backfill.</remarks>
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
@@ -1979,6 +1979,14 @@ namespace Adminbot.Migrations
 
             modelBuilder.Entity("Adminbot.Domain.TenantCardProvisionalOperation", b =>
                 {
+                    b.Property<string>("LastMutationStage").HasColumnType("TEXT");
+
+                    b.Property<string>("LastProvenStep").HasColumnType("TEXT");
+
+                    b.Property<bool>("MutationPending").HasColumnType("INTEGER");
+
+                    b.Property<long?>("ReviewedRecoveryId").HasColumnType("INTEGER");
+
                     b.Property<string>("OperationKey")
                         .HasMaxLength(240)
                         .HasColumnType("TEXT");
@@ -2053,6 +2061,78 @@ namespace Adminbot.Migrations
                     b.HasIndex("Step", "UpdatedAtUtc");
 
                     b.ToTable("TenantCardProvisionalOperations");
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.TenantCardProvisionalReview", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ActorTelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("AuthorizedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BindingHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BotId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("CompletedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("EvidenceJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ExpectedInboundIdsJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OperationKey")
+                        .IsRequired()
+                        .HasMaxLength(240)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OriginalReason")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OutcomeCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ResumeStep")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SnapshotHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("TenantBotOrderId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status", "ExpiresAtUtc");
+
+                    b.HasIndex("TenantBotOrderId", "CreatedAtUtc");
+
+                    b.ToTable("TenantCardProvisionalReviews");
                 });
 
             modelBuilder.Entity("Adminbot.Domain.TenantDebtTransfer", b =>

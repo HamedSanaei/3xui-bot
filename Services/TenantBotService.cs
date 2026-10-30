@@ -10031,6 +10031,8 @@ public partial class TenantBotService
     /// generation after a definitive rejection. Callers must never pass customer text here.
     /// </param>
     /// <returns>A settlement result with owner-wallet before/after balances when fulfillment succeeds.</returns>
+    /// <param name="provisionalReview">Optional actor/bot/chat-bound second confirmation for same-client tenant-card recovery.
+    /// Fresh GET/payment proof is repeated under the order gate before any saga or financial effect; null cannot reopen manual review.</param>
     /// <remarks>
     /// Idempotency:
     /// callback, customer check, and manual paths share a gate for the same tenant order and reload the order before checking
@@ -10055,7 +10057,8 @@ public partial class TenantBotService
         SwapinoPaymentInfo NOWPAYMENTSPAYMENT,
         bool DEBITOWNERBASECOST,
         CancellationToken CancellationToken,
-        TenantProvisioningRetryAuthorization retryAuthorization = null)
+        TenantProvisioningRetryAuthorization retryAuthorization = null,
+        TenantCardReviewedRecoveryRequest provisionalReview = null)
     {
         using var tenantFulfillmentGateLease = await TenantFulfillmentGate.EnterAsync(order.Id.ToString(CultureInfo.InvariantCulture), CancellationToken);
         try
@@ -10068,6 +10071,21 @@ public partial class TenantBotService
             await _workflow.ReloadAsync(order, CancellationToken);
             if (order.IsFulfilled)
                 return NowPaymentsSettlementResult.AlreadyAdded(order.OwnerBalanceAfter ?? 0);
+
+            if (provisionalReview != null)
+            {
+                // Authorization and live proof occur only AFTER exclusive order ownership, before even the paid marker.
+                var reviewer = _serviceProvider.GetRequiredService<TenantCardProvisionalManualReviewService>();
+                if (!await reviewer.AuthorizeUnderOrderGateAsync(order, provisionalReview, CancellationToken))
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
+            else if (order.PaymentProvider == "tenant_card" && await _workflow.ReadAsync(db =>
+                         db.TenantCardProvisionalOperations.AnyAsync(x => x.TenantBotOrderId == order.Id &&
+                             x.ReviewedRecoveryId != null, CancellationToken)))
+            {
+                // A consumed/interrupted reviewed recovery cannot silently restart via a provider callback or Verify payment.
+                return NowPaymentsSettlementResult.ProviderNotPaid();
+            }
 
             if (order.PaymentProvider == "wallet")
             {
@@ -10212,6 +10230,11 @@ public partial class TenantBotService
                     order,
                     resolvedPurchase,
                     CancellationToken);
+                if (provisionalReview != null && !provisionalOutcome.Handled)
+                {
+                    // A live feature/configuration change must never turn reviewed same-client recovery into new creation.
+                    return NowPaymentsSettlementResult.ProviderNotPaid();
+                }
                 if (provisionalOutcome.Handled && !provisionalOutcome.Success)
                 {
                     await HANDLETENANTCARDPROVISIONALBLOCKEDASYNC(order, provisionalOutcome, Source, CancellationToken);
@@ -10345,10 +10368,11 @@ public partial class TenantBotService
                     return NowPaymentsSettlementResult.Applied(order.OwnerBalanceBefore ?? 0, order.OwnerBalanceAfter ?? 0);
                 }
                 order.PaymentStatus = TenantBotOrderStatuses.Failed;
-                order.ErrorMessage = ex.Message;
+                order.ErrorMessage = provisionalReview != null ? "provisional_review_execution_incomplete" : ex.Message;
                 order.UpdatedAtUtc = DateTime.UtcNow;
                 await _workflow.SaveAsync(CancellationToken);
-                await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, ex.Message, CancellationToken);
+                await NOTIFYTENANTCUSTOMERFAILUREASYNC(order, provisionalReview != null
+                    ? "تکمیل سفارش موقت هنوز تأیید نشده است؛ سفارش برای بررسی پشتیبانی محفوظ است." : ex.Message, CancellationToken);
                 LOGTENANTORDER(order, owner, customer, Source, $"Exception ({ex.GetType().Name})", timing: operationTiming.Snapshot());
                 return NowPaymentsSettlementResult.InvalidAmount();
             }
@@ -10442,6 +10466,8 @@ public partial class TenantBotService
     /// started provisional mutation remains replaceable/recoverable. Actual transfer evidence ingestion is not discarded.
     /// Fresh exact-owner funding also gates unsubmitted personal-card prompts. Persisted receipt evidence and started
     /// provisional work stay replaceable after insufficient funding; actual transfer images are never discarded.
+    /// Explicit administrator-reviewed recovery is the exception: its approved receipt and order are frozen,
+    /// so replacement prompts are refused without altering payment status or the customer's existing upload target.
     /// </remarks>
     /// <exception cref="OperationCanceledException">The caller cancels ownership, funding, bot-scoped state, or the prompt.</exception>
     /// <example><code>await PromptTenantReceiptUploadAsync(client, customerChatId, order.Id, customer.TelegramUserId, token);</code></example>
@@ -10463,6 +10489,12 @@ public partial class TenantBotService
         if (order == null)
         {
             await botClient.SendMessage(ChatId, "سفارش کارت‌به‌کارت فعالی برای ارسال رسید پیدا نشد.", cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (await IsReviewedProvisionalReceiptLockedAsync(order.Id, CancellationToken))
+        {
+            await botClient.SendMessage(ChatId, "این سفارش در بررسی دستی پشتیبانی قفل شده است؛ رسید تأییدشده آن قابل جایگزینی نیست.", cancellationToken: CancellationToken);
             return;
         }
 
@@ -10519,7 +10551,7 @@ public partial class TenantBotService
     /// rejected without touching the database.
     /// </param>
     /// <param name="CancellationToken">Cancellation Token for users.db and Telegram calls.</param>
-    /// <returns>A task completing after the receipt and its durable owner-notification intent are committed.</returns>
+    /// <returns>A task after receipt/outbox commit or a safe refusal when reviewed recovery has frozen existing approved evidence.</returns>
     /// <remarks>
     /// <para>
     /// This method does not FULFILL the order. It stores an auditable pending receipt and its durable Sales Assistant
@@ -10559,6 +10591,12 @@ public partial class TenantBotService
 
         // Receipt row + owner-notification outbox row commit together, and only then is any panel work attempted.
         var receiptId = await PERSISTTENANTMANUALRECEIPTASYNC(order.Id, receiptMedia.FileId, CancellationToken);
+        if (receiptId == -2)
+        {
+            await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
+            await botClient.SendMessage(Message.Chat.Id, "این سفارش در بررسی دستی پشتیبانی است؛ رسید تأییدشده آن قابل جایگزینی نیست.", cancellationToken: CancellationToken);
+            return;
+        }
         if (receiptId <= 0)
         {
             await _state.ClearPendingReceiptTargetAsync(customer.TelegramUserId, CancellationToken);
@@ -10955,12 +10993,19 @@ public partial class TenantBotService
     }
 
     /// <summary>Atomically saves the receipt state and its durable Sales Assistant relay intent in users.db.</summary>
+    /// <param name="orderDbId">Internal exact tenant order selected by the authenticated customer's existing receipt flow.</param>
+    /// <param name="photoFileId">Telegram receipt photo id; private, never logged.</param>
+    /// <param name="cancellationToken">Short receipt/outbox transaction cancellation.</param>
+    /// <returns>Saved receipt id; zero for expired/ineligible discount, or -2 when reviewed recovery has frozen approved evidence.</returns>
+    /// <remarks>The durable review lock is checked inside the same writer transaction as replacement; no panel or financial calls occur.</remarks>
     private Task<int> PERSISTTENANTMANUALRECEIPTASYNC(int orderDbId, string photoFileId, CancellationToken cancellationToken)
     {
         return _workflow.WriteAsync(async db =>
         {
             await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
             var order = await db.TenantBotOrders.SingleAsync(x => x.Id == orderDbId, cancellationToken);
+            if (await db.TenantCardProvisionalOperations.AnyAsync(x => x.TenantBotOrderId == order.Id && x.ReviewedRecoveryId != null, cancellationToken))
+                return -2;
             var receipt = order.ManualReceiptId.HasValue
                 ? await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, cancellationToken)
                 : await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, cancellationToken);
@@ -11147,6 +11192,7 @@ public partial class TenantBotService
 
     /// <summary>
     /// Final-confirms a tenant card-to-card receipt from the Sales Assistant and fulfills the linked order once.
+    /// An explicitly reviewed provisional claim freezes receipt evidence and refuses later owner edits.
     /// </summary>
     /// <param name="RECEIPTID">
     /// Internal <c>users.db</c> id of the receipt selected in the Sales Assistant bot.
@@ -11180,6 +11226,9 @@ public partial class TenantBotService
             CancellationToken));
         if (order == null)
             return "سفارش مرتبط با رسید پیدا نشد.";
+
+        if (await IsReviewedProvisionalReceiptLockedAsync(order.Id, CancellationToken))
+            return "این رسید برای بازیابی دستی پشتیبانی قفل شده است؛ تأیید مجدد آن مجاز نیست.";
 
         if (string.Equals(order.OrderKind, TenantBotOrderKinds.WalletCharge, StringComparison.OrdinalIgnoreCase))
         {
@@ -11273,6 +11322,7 @@ public partial class TenantBotService
     /// <para>
     /// Idempotent: an already-rejected receipt is not rewritten, and a revoked saga only re-reads and re-proves the
     /// disabled panel state, so a duplicate reject callback cannot issue another mutation.
+    /// Reviewed provisional recovery freezes its approved evidence; rejection then returns a support-only refusal without any write.
     /// </para>
     /// </remarks>
     /// <example>
@@ -11298,6 +11348,9 @@ public partial class TenantBotService
             CancellationToken));
         if (order == null)
             return "سفارش مرتبط با رسید پیدا نشد.";
+
+        if (await IsReviewedProvisionalReceiptLockedAsync(order.Id, CancellationToken))
+            return "این رسید برای بازیابی دستی پشتیبانی قفل شده است؛ رد یا تغییر آن مجاز نیست.";
 
         // The review outcome is recorded first and independently of the panel, so the owner's decision is never lost
         // because XUI was unreachable.
@@ -11411,6 +11464,7 @@ public partial class TenantBotService
     /// a receipt audit row when needed, marks it approved, and delegates fulfillment to the same idempotent
     /// method used by assistant final confirmation. If the order was already fulfilled, the method does not
     /// create another account or ledger entry and only resends existing account details to the tenant owner.
+    /// Explicitly reviewed provisional purchases cannot rewrite the receipt or bypass administrator recovery.
     /// </remarks>
     /// <returns>A task completing after owner/order validation, authorized fulfillment and its result response.</returns>
     private async Task CONFIRMMANUALCARDORDERBYORDERIDASYNC(
@@ -11450,6 +11504,11 @@ public partial class TenantBotService
         {
             await botClient.SendMessage(Message.Chat.Id, "این سفارش تخفیف منقضی یا رد شده است؛ تایید آن مجاز نیست.",
                 cancellationToken: CancellationToken);
+            return;
+        }
+        if (await IsReviewedProvisionalReceiptLockedAsync(order.Id, CancellationToken))
+        {
+            await botClient.SendMessage(Message.Chat.Id, "این سفارش در بازیابی دستی پشتیبانی قفل شده است؛ تأیید مجدد رسید از این مسیر مجاز نیست.", cancellationToken: CancellationToken);
             return;
         }
         var receipt = await ENSUREMANUALRECEIPTASYNC(order, owner.TelegramUserId, CancellationToken);
@@ -11532,6 +11591,8 @@ public partial class TenantBotService
     /// This method is idempotent. Fulfilled orders are not charged or created again; stored account details are only
     /// resent. Unfulfilled orders run the same fulfillment path used by IPN, customer checks, owner card approval,
     /// and Sales Assistant final confirmation.
+    /// Provisional purchases parked in manual review are redirected to the separate reviewed-recovery UI before
+    /// receipt approval is changed. They are not amount failures and Verify payment must not reopen their saga.
     /// </remarks>
     public async Task<string> CONFIRMTENANTORDERBYSUPERADMINASYNC(
         string orderId,
@@ -11569,6 +11630,10 @@ public partial class TenantBotService
         }
 
         NowPaymentsSettlementResult settlement;
+        if (order.PaymentProvider == "tenant_card" && order.OrderKind == TenantBotOrderKinds.Purchase &&
+            await _workflow.ReadAsync(db => db.TenantCardProvisionalOperations.AnyAsync(x => x.TenantBotOrderId == order.Id &&
+                (x.Step == TenantCardProvisionalSteps.ManualReview || x.ReviewedRecoveryId != null), CancellationToken)))
+            return "🛠 ارتقای اکانت موقت نیاز به بررسی دستی دارد؛ این خطا مربوط به مبلغ نیست. از «🛠 بررسی دستی سفارش‌های موقت» سفارش را بررسی و پس از تأیید جداگانه بازیابی کنید. هیچ پرداخت جدیدی ثبت نشد.";
         // This super-admin command is an explicit recovery action, so fulfillment may advance a definitively
         // rejected attempt to the next generation under a durable per-update authorization.
         var retryAuthorization = TenantProvisioningRetryAuthorization.TryTelegramConfirmation(
@@ -11706,7 +11771,10 @@ public partial class TenantBotService
     /// <remarks>
     /// The database has a unique index on <see cref="TenantManualPaymentReceipt.TenantBotOrderId" />, so this method
     /// always reuses an existing row before creating a new one.
+    /// Once reviewed provisional authorization commits, receipt creation/reuse for editing is refused. Stale callers
+    /// are also fenced by the receipt's version change at authorization; no new approval evidence is fabricated.
     /// </remarks>
+    /// <exception cref="InvalidOperationException">An explicit reviewed recovery has frozen this order's approved receipt.</exception>
     private async Task<TenantManualPaymentReceipt> ENSUREMANUALRECEIPTASYNC(
         TenantBotOrder order,
         long reviewerTelegramUserId,
@@ -11717,6 +11785,9 @@ public partial class TenantBotService
         var receipt = order.ManualReceiptId.HasValue
             ? await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.Id == order.ManualReceiptId.Value, CancellationToken))
             : await _workflow.ReadAsync(async db => await db.TenantManualPaymentReceipts.FirstOrDefaultAsync(x => x.TenantBotOrderId == order.Id, CancellationToken));
+
+        if (await IsReviewedProvisionalReceiptLockedAsync(order.Id, CancellationToken))
+            throw new InvalidOperationException("Reviewed provisional recovery has frozen the approved receipt.");
 
         if (receipt != null)
             return receipt;

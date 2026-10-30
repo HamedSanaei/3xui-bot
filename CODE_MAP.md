@@ -1612,7 +1612,7 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   (`claimed/disabled/reset/re_disabled/zeroed/quota_written/proven/revoked/manual_review`) and
   `TenantCardProvisionalOperationStore` (`ClaimAsync`/`AdvanceAsync`/`MarkManualReviewAsync`/`FindAsync`) enforces
   **forward-only** progress in short users.db transactions: a replayed step returns `false`, a row never rewinds, and
-  `manual_review` is terminal so an ambiguous panel outcome escalates to a human instead of replaying. An unknown stored
+  `manual_review` is terminal to ordinary callers; explicit reviewed recovery is the only audited exception below. An unknown stored
   step sorts above every mutable step, which is the fail-closed direction. The table is audit state and holds no tokens,
   balances, ledger rows, or raw payloads; it is created empty and backfills nothing.
   **WIRED:** production callers are `PROVISIONTENANTCARDPROVISIONALASYNC` (create, after
@@ -1632,7 +1632,8 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   callbacks only re-read and re-prove. Rejection settles no money in either direction and keeps the order unfulfilled.
   **Reminder exclusion:** both reminder scans skip provisional courtesy clients by plan key / comment
   (`IsProvisionalPlanKey` / `IsProvisionalClientComment`), since a 1 GB / 1 day courtesy allowance would otherwise produce
-  a misleading paid-service reminder; finalization replaces the plan key, so a finalized account becomes eligible again.
+  a misleading paid-service reminder. Existing finalization preserves the panel comment (only quota/expiry/enable change),
+  so a retained provisional PlanKey can continue excluding a finalized client; metadata promotion needs a separate fix.
   Residual limitation: the volume scan can only read the comment the `clients/list` response reports, so if a panel omits
   it there the exclusion is best-effort for that single scan.
   **Gozargah:** provisional creation never enqueues a site sync. `QueueGozargahSyncBestEffortAsync("tenant-create", ...)`
@@ -1651,6 +1652,21 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   intermediate state can pair the large purchased quota with a stale depletion baseline. The post-approval `TotalGB` is
   the **absolute** ordered quota, never `purchasedBytes + usedBytes`; a bounded number of post-quota counter re-clears
   handles a customer still using the account and then escalates to `manual_review`.
+- **Provisional purchase manual review:** `TenantCardProvisionalManualReviewService` / `...AdminService` and
+  `TenantBotService.ProvisionalReview.cs` add private enabled-owned global-admin list/exact-OrderId search and GET-only
+  reprobe. Separate durable ten-minute actor/bot/chat-bound confirmations repeat proof under the central order gate;
+  `TryAuthorizeReviewedRecoveryAsync` is the sole conditional exception to terminal manual review. Only pre-write
+  corrected placement may reopen `claimed`; partial/uncertain work requires complete frozen-target GET proof or stays
+  locked. Exact receipt/store/owner/customer/amount, Applied creation identity/panel, active service placement and absence
+  of competing mutations/initial financial artifacts are mandatory. No new client, payment approval or settlement path.
+  Reviewed pre-dispatch markers prohibit ambiguous POST replay; proven settlement retries never reset paid usage.
+  Existing tenant wallet receipt keys, tenant ledger uniqueness and fulfillment/outbox commit remain authoritative.
+  Authorization fences stale receipt writers via UpdatedAtUtc; owner approve/reject, receipt ensure and transactional
+  customer photo replacement refuse edits after the durable reviewed claim, preserving approved payment evidence.
+  Migration `20261030113439_AddTenantCardProvisionalReviewedRecovery` adds nullable saga audit fields plus false pending
+  marker and an empty permanent review table; no historical authorization, backfill or financial/panel effect.
+  Verify-payment redirects manual cases rather than reporting InvalidAmount. No background recovery or lease rearming.
+  Tests: `TenantCardProvisionalManualReviewTests.cs`; operator backup/deploy/rollback: `docs/tenant-card-provisional-manual-review.md`.
 - `XuiV3AccountMetadataOptions.PlanKeyOverride` / `PlanNameOverride` let a non-catalog account record a meaningful plan
   label in the panel comment (the comment JSON is the durable signal reminder/sync logic can key on).
 - UX-only Telegram latency budgets are injectable for tests through the immutable

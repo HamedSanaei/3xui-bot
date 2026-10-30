@@ -25,7 +25,7 @@ namespace Adminbot.Services
     /// mutation that may already have been applied.
     /// </para>
     /// </remarks>
-    public sealed class TenantCardProvisionalOperationStore
+    public sealed partial class TenantCardProvisionalOperationStore
     {
         private readonly UserDbContextFactory _factory;
 
@@ -57,6 +57,7 @@ namespace Adminbot.Services
         /// <remarks>
         /// The claim is the first durable boundary of the saga. No panel mutation may be attempted before it commits,
         /// because only a committed claim tells a restarted process that a saga is in flight for this order.
+        /// A reviewed finalize also fences new revoke claims; an existing revoke is rejected by reviewed admission before authorization.
         /// </remarks>
         /// <example>
         /// <code>
@@ -95,6 +96,11 @@ namespace Adminbot.Services
                     return (row, false);
                 }
 
+                // A reviewed finalize authorization must never race a new revocation of the same paid client.
+                if (kind == TenantCardProvisionalOperationKinds.Revoke && await db.TenantCardProvisionalOperations.AnyAsync(
+                    x => x.TenantBotOrderId == tenantBotOrderId && x.ReviewedRecoveryId != null, ct))
+                    throw new InvalidOperationException("Reviewed provisional finalization blocks revocation.");
+
                 var now = DateTime.UtcNow;
                 var candidate = new TenantCardProvisionalOperation
                 {
@@ -131,6 +137,7 @@ namespace Adminbot.Services
         /// Forward-only semantics matter for restart safety: a replayed step that is already recorded returns
         /// <c>false</c>, which lets the saga skip the mutation and continue from the furthest proven step. Terminal steps
         /// such as manual review can never be advanced past.
+        /// Successful forward proof records LastProvenStep and clears the durable pending-mutation marker.
         /// </remarks>
         public Task<bool> AdvanceAsync(string operationKey, string step, string evidenceJson, CancellationToken token)
         {
@@ -156,6 +163,11 @@ namespace Adminbot.Services
 
                 var now = DateTime.UtcNow;
                 row.Step = step;
+                if (step != TenantCardProvisionalSteps.ManualReview)
+                {
+                    row.LastProvenStep = step;
+                    row.MutationPending = false;
+                }
                 row.UpdatedAtUtc = now;
                 if (!string.IsNullOrWhiteSpace(evidenceJson))
                     row.EvidenceJson = evidenceJson;
@@ -215,6 +227,7 @@ namespace Adminbot.Services
                     .Where(x => x.OperationKey == operationKey &&
                                 x.Step != TenantCardProvisionalSteps.ManualReview)
                     .ExecuteUpdateAsync(set => set
+                        .SetProperty(x => x.LastProvenStep, x => x.Step)
                         .SetProperty(x => x.Step, TenantCardProvisionalSteps.ManualReview)
                         .SetProperty(x => x.ErrorCode, errorCode)
                         .SetProperty(x => x.CompletedAtUtc, DateTime.UtcNow)

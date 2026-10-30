@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Adminbot.Domain;
 using Adminbot.Domain.TelegramUi;
 using Adminbot.Services.AppleMobileConfig;
+using Adminbot.Services;
 using Adminbot.Services.TelegramEndpoints;
 using Adminbot.Utils;
 
@@ -144,6 +145,7 @@ public partial class TelegramBotService
         TelegramEndpointAdminService.Action,
         "🤖 وضعیت ربات‌ها",
         AdminManualReviewAction,
+        TenantCardProvisionalManualReviewAdminService.Action,
         "📑 Menu"
     };
 
@@ -248,6 +250,8 @@ public partial class TelegramBotService
     private readonly XuiV3PurchaseSessionStore _xuiV3PurchaseSessionStore;
     private readonly XuiV3AdminFlowService _xuiV3AdminFlowService;
     private readonly XuiV3RenewalManualReviewAdminService _xuiV3RenewalManualReviewAdminService;
+    /// <summary>Private global-admin same-client provisional purchase recovery; separate from renewal and receipt approval.</summary>
+    private readonly TenantCardProvisionalManualReviewAdminService _provisionalManualReview;
     private readonly TenantBotService _tenantBotService;
     private readonly SalesAssistantService _salesAssistantService;
     private readonly UserActivityLogService _userActivityLog;
@@ -395,6 +399,7 @@ public partial class TelegramBotService
     /// <param name="mandatoryJoinMembershipCache">Optional owned-bot membership cache; null creates the standard cache without changing join requirements.</param>
     /// <param name="appleMobileConfigFlow">Optional Apple APN profile flow; null leaves that integration unavailable.</param>
     /// <param name="endpointAdmin">Optional singleton global-super-admin endpoint panel with private-owned-host authorization and durable queued migrations.</param>
+    /// <param name="provisionalManualReview">Optional scoped private global-admin panel for explicit provisional purchase recovery; never approves payment evidence or uses renewal settlement.</param>
     /// <remarks>
     /// The service belongs to one execution/request scope. Conversation and financial stores create independent
     /// users.db contexts through their factories. Runtime bot identity always comes from <see cref="BotContextAccessor"/>
@@ -448,7 +453,8 @@ public partial class TelegramBotService
         TelegramInteractionTimeouts interactionTimeouts = null,
         ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
         AppleMobileConfigTelegramFlow appleMobileConfigFlow = null,
-        TelegramEndpointAdminService endpointAdmin = null)
+        TelegramEndpointAdminService endpointAdmin = null,
+        TenantCardProvisionalManualReviewAdminService provisionalManualReview = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -480,6 +486,7 @@ public partial class TelegramBotService
         _xuiV3PurchaseSessionStore = xuiV3PurchaseSessionStore;
         _xuiV3AdminFlowService = xuiV3AdminFlowService;
         _xuiV3RenewalManualReviewAdminService = xuiV3RenewalManualReviewAdminService;
+        _provisionalManualReview = provisionalManualReview;
         _tenantBotService = tenantBotService;
         _salesAssistantService = salesAssistantService;
         _userActivityLog = userActivityLog;
@@ -921,6 +928,8 @@ public partial class TelegramBotService
     /// tutorial platform/parent navigation never clears the requesting bot/user's active conversation.
     /// Download navigation accepts fixed Happ/parent callbacks behind existing access gates and the live download switch;
     /// six vendor links are rendered without release-provider requests or purchase/renewal state changes.
+    /// Private provisional manual-review actions preempt stale conversations and recheck global administrator authority
+    /// on every callback; second confirmations enter the existing tenant order gate, never the renewal settlement path.
     /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
     /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
     /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
@@ -1081,6 +1090,10 @@ public partial class TelegramBotService
 
             // Manual-review resolution callbacks are gated on the configured super-admin allow-list before dispatch, and
             // the handler rechecks authorization internally because callback data is client-supplied.
+            if (TenantCardProvisionalManualReviewAdminService.IsCallback(callbackQuery.Data) &&
+                _provisionalManualReview != null && await _provisionalManualReview.TryHandleCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
+
             if (callbackIsSuperAdmin &&
                 XuiV3RenewalManualReviewAdminService.IsManualReviewCallback(callbackQuery.Data) &&
                 await _xuiV3RenewalManualReviewAdminService.TryHandleCallbackAsync(
@@ -1178,6 +1191,8 @@ public partial class TelegramBotService
         // The same precedence applies to "📑 Menu": while the super-admin panel is open it must abandon any stale
         // admin sub-flow and return to the owned-bot main menu without touching super-admin authorization.
         if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
+            return;
+        if (_provisionalManualReview != null && await _provisionalManualReview.TryHandleMessageAsync(botClient, message, cancellationToken))
             return;
         if (isOwnedBot && await TryHandleSalesControlMessageAsync(botClient, message, isOwnedBot, cancellationToken))
             return;

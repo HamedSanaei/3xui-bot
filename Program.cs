@@ -345,6 +345,8 @@ public class Program
         services.AddScoped<TenantCardProvisionalProvisioningService>();
         services.AddScoped<TenantCardProvisionalFinalizationService>();
         services.AddScoped<TenantCardProvisionalRevocationService>();
+        services.AddScoped<TenantCardProvisionalManualReviewService>();
+        services.AddScoped<TenantCardProvisionalManualReviewAdminService>();
         services.AddSingleton<XuiV3LinkChangeOperationStore>();
         services.AddScoped<XuiV3BotFlowService>();
         services.AddScoped<XuiV3AdminFlowService>();

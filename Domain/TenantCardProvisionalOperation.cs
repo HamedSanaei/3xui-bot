@@ -185,6 +185,15 @@ namespace Adminbot.Domain
         /// <summary>Gets or sets the furthest durably proven <see cref="TenantCardProvisionalSteps" /> value.</summary>
         public string Step { get; set; } = TenantCardProvisionalSteps.Claimed;
 
+        /// <summary>Last proven step before escalation; null for historical rows whose progress must be inferred conservatively.</summary>
+        public string LastProvenStep { get; set; }
+        /// <summary>True after a mutation intent commits and until its effect is durably proven; never authorizes replay in reviewed recovery.</summary>
+        public bool MutationPending { get; set; }
+        /// <summary>Closed mutation stage for audit, without request bodies or account credentials.</summary>
+        public string LastMutationStage { get; set; }
+        /// <summary>Logical reference to the administrator review that authorized recovery; null never grants historical automatic recovery.</summary>
+        public long? ReviewedRecoveryId { get; set; }
+
         /// <summary>
         /// Gets or sets the UTC instant the purchased subscription period starts from, captured exactly once.
         /// </summary>
