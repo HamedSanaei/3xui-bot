@@ -8829,6 +8829,8 @@ public partial class TenantBotService
     /// A first local invoice and provider POST require fresh exact-owner funding and live central permission.
     /// Underfunding ignores saved provider opt-outs. Existing linked invoices bypass new-admission checks.
     /// Global commercial sale/renewal permission is independently re-read in that first-invoice branch.
+    /// Both invoice URLs persist separately and are displayed bot-first, online-second for new and reused invoices.
+    /// They refer to the same PayId and never authorize delivery without the existing authoritative inquiry.
     /// </remarks>
     /// <returns>A task completing after the order's invoice attempt and customer response; uncertain attempts stay reserved.</returns>
     /// <exception cref="OperationCanceledException">The caller cancels the invoice gate, funding, persistence, or delivery.</exception>
@@ -8860,13 +8862,13 @@ public partial class TenantBotService
             }
             if (payment != null)
             {
-                if (!string.IsNullOrWhiteSpace(payment.PayId) && !string.IsNullOrWhiteSpace(payment.PaymentLink))
+                if (!string.IsNullOrWhiteSpace(payment.PayId) && payment.GetPrimaryPaymentLink() != null)
                 {
                     order.TetraminatorPaymentInfoId = payment.Id;
-                    order.PaymentUrl = payment.PaymentLink;
+                    order.PaymentUrl = payment.GetPrimaryPaymentLink();
                     order.UpdatedAtUtc = DateTime.UtcNow;
                     await _workflow.SaveAsync(cancellationToken);
-                    existingPaymentLink = payment.PaymentLink;
+                    existingPaymentLink = payment.GetPrimaryPaymentLink();
                 }
                 else
                 {
@@ -8926,9 +8928,9 @@ public partial class TenantBotService
         {
             await botClient.SendMessage(
                 chatId,
-                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور") + "\n\n" + TetraminatorCustomerPaymentUi.Guidance,
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantPaymentKeyboard(order, existingPaymentLink),
+                replyMarkup: BuildTenantTetraminatorPaymentKeyboard(order, payment),
                 cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(
                 botClient,
@@ -8956,7 +8958,7 @@ public partial class TenantBotService
             payment.RawResponseJson = JsonConvert.SerializeObject(invoice);
             payment.Apply(invoice);
             order.TetraminatorPaymentInfoId = payment.Id;
-            order.PaymentUrl = payment.PaymentLink;
+            order.PaymentUrl = payment.GetPrimaryPaymentLink();
             order.PaymentStatus = TenantBotOrderStatuses.Pending;
             order.ErrorMessage = null;
             if (order.DiscountInvoiceAttemptState == "started") order.DiscountInvoiceAttemptState = "created";
@@ -8965,9 +8967,9 @@ public partial class TenantBotService
 
             await botClient.SendMessage(
                 chatId,
-                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور"),
+                BUILDTENANTGATEWAYPAYMENTTEXT(order, "تترامیناتور") + "\n\n" + TetraminatorCustomerPaymentUi.Guidance,
                 parseMode: ParseMode.Html,
-                replyMarkup: BuildTenantPaymentKeyboard(order, payment.PaymentLink),
+                replyMarkup: BuildTenantTetraminatorPaymentKeyboard(order, payment),
                 cancellationToken: cancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, "فاکتور تترامیناتور ساخته شد.", cancellationToken: cancellationToken);
         }
@@ -11884,6 +11886,8 @@ public partial class TenantBotService
     /// <remarks>
     /// This method is used by tenant payment keyboards and payment return checks. It is idempotent: fulfilled
     /// orders are never built or charged again; their stored account details are resent to the buyer instead.
+    /// Unpaid/unavailable Tetraminator inquiries redisplay both saved routes, bot first then online;
+    /// neither redisplay creates an invoice or changes the existing settlement authorization.
     /// </remarks>
     private async Task CheckTenantOrderAsync(ITelegramBotClient botClient, ChatId ChatId, int ORDERDBID, long CustomerTelegramUserId, CancellationToken CancellationToken)
     {
@@ -12127,11 +12131,11 @@ public partial class TenantBotService
 
                 await botClient.SendMessage(
                     ChatId,
-                    errorCode == "provider_not_paid"
+                    (errorCode == "provider_not_paid"
                         ? $"پرداخت هنوز تایید نشده است.\nوضعیت فعلی: <code>{Html(tetraminatorPayment.PaymentStatus)}</code>"
-                        : "اطلاعات پرداخت تترامیناتور با سفارش تطبیق نداشت و سفارش تحویل نشد.",
+                        : "اطلاعات پرداخت تترامیناتور با سفارش تطبیق نداشت و سفارش تحویل نشد.") + "\n\n" + TetraminatorCustomerPaymentUi.Guidance,
                     parseMode: ParseMode.Html,
-                    replyMarkup: BuildTenantPaymentKeyboard(order, tetraminatorPayment.PaymentLink),
+                    replyMarkup: BuildTenantTetraminatorPaymentKeyboard(order, tetraminatorPayment),
                     cancellationToken: CancellationToken);
                 return;
             }
@@ -12149,8 +12153,8 @@ public partial class TenantBotService
                     tetraminatorPayment.Id);
                 await botClient.SendMessage(
                     ChatId,
-                    "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.",
-                    replyMarkup: BuildTenantPaymentKeyboard(order, tetraminatorPayment.PaymentLink),
+                    "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره دکمه بررسی وضعیت را بزنید.\n\n" + TetraminatorCustomerPaymentUi.Guidance,
+                    replyMarkup: BuildTenantTetraminatorPaymentKeyboard(order, tetraminatorPayment),
                     cancellationToken: CancellationToken);
                 return;
             }
@@ -14132,6 +14136,15 @@ public partial class TenantBotService
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت پرداخت", CUSTOMERCALLBACKPREFIX + $"chk:{order.Id}") });
         return new InlineKeyboardMarkup(rows);
     }
+
+    /// <summary>Preserves both saved Tetraminator routes in bot-then-online order for purchase/renewal redisplay.</summary>
+    /// <param name="order">Current ownership-checked tenant order; its internal id supplies the existing inquiry callback.</param>
+    /// <param name="payment">Saved invoice for this exact order, including independently persisted optional URLs.</param>
+    /// <returns>Two available payment choices, then existing status and storefront-return buttons; no new invoice or financial effect.</returns>
+    /// <remarks>Never read raw inquiry JSON for URLs because it replaces the create response. Caller already enforces tenant/customer isolation.</remarks>
+    private static InlineKeyboardMarkup BuildTenantTetraminatorPaymentKeyboard(TenantBotOrder order, TetraminatorPaymentInfo payment)
+        => TetraminatorCustomerPaymentUi.BuildKeyboard(payment.PaymentLink, payment.GatewayLink,
+            CUSTOMERCALLBACKPREFIX + $"chk:{order.Id}", CUSTOMERCALLBACKPREFIX + "home");
 
     /// <summary>
     /// Builds the inline CONTROLS shown on A tenant card-to-card order.

@@ -25,7 +25,9 @@ public partial class TenantBotService
     /// provider preferences. Personal-card top-ups require restored owner funding before a new receipt order is created.
     /// New order activation and first debit require the live global sale/renewal switch. Exact committed receipts bypass
     /// admission and continue settlement/recovery even when the category, owner funding, or storefront approval later closes.
-    /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.</remarks>
+    /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.
+    /// Tetraminator invoices display the saved bot and online routes in that order with single-payment guidance;
+    /// the existing inquiry callback remains responsible for ownership and payment verification.</remarks>
     /// <exception cref="OperationCanceledException">The caller cancels approval, funding, state, or fulfillment work.</exception>
     /// <example><code>if (await TryHandleCustomerWalletAsync(client, update, customer, state, token)) return;</code></example>
     private async Task<bool> TryHandleCustomerWalletAsync(ITelegramBotClient client, Update update, CredUser customer, User state, CancellationToken token)
@@ -134,6 +136,12 @@ public partial class TenantBotService
                             invoice.CheckCallback,
                             directCard: false),
                         cancellationToken: token);
+                }
+                else if (invoice.TetraminatorLinks != null)
+                {
+                    await client.SendMessage(chat, invoice.Notice,
+                        replyMarkup: TetraminatorCustomerPaymentUi.BuildKeyboard(invoice.TetraminatorLinks.PaymentLink,
+                            invoice.TetraminatorLinks.GatewayLink, invoice.CheckCallback), cancellationToken: token);
                 }
                 else
                 {

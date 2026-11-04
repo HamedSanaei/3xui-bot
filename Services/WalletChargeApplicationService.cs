@@ -23,8 +23,9 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="CheckCallback">Compact callback identifying the persisted payment; the handler must revalidate ownership.</param>
     /// <param name="Notice">Persian customer-facing payment guidance without secrets.</param>
     /// <param name="DirectPayment">Optional AtlasPay card details kept only in this in-memory result for immediate customer display.</param>
+    /// <param name="TetraminatorLinks">Optional bot/online choices for ONE Tetraminator invoice; never raw provider credentials.</param>
     public sealed record Invoice(string Url, string CheckCallback, string Notice,
-        AtlasPayCustomerPaymentUi.DirectPayment DirectPayment = null);
+        AtlasPayCustomerPaymentUi.DirectPayment DirectPayment = null, TetraminatorCustomerPaymentUi.Links TetraminatorLinks = null);
 
     /// <summary>Issues the shared owned/tenant HooshPay wallet invoice after its row has committed.</summary>
     /// <param name="payment">Persisted wallet-charge row, including immutable origin and amount.</param>
@@ -172,11 +173,12 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="amount">Validated positive whole toman credit amount.</param>
     /// <param name="gateway">Explicit central gateway chosen by this customer.</param>
     /// <param name="token">Cancellation of database and external calls; provider calls never run inside a transaction.</param>
-    /// <returns>A customer invoice link and ownership-checked inquiry callback.</returns>
+    /// <returns>A customer invoice link and ownership-checked inquiry callback; Tetraminator also returns both optional routes in provider order.</returns>
     /// <exception cref="InvalidOperationException">Approval, owner identity, funding evaluator, gateway or amount is invalid.</exception>
     /// <remarks>The row commits before the non-retried provider create. Uncertain creation must never be automatically repeated.
     /// Required read-only owner funding is refreshed at admission and again before POST. Insufficient funding uses only live central providers regardless of tenant opt-outs.
-    /// PaymentPurpose always remains wallet_charge; legitimate settlement continues after approval or funding changes.</remarks>
+    /// PaymentPurpose always remains wallet_charge; legitimate settlement continues after approval or funding changes.
+    /// Tetraminator routes are persisted independently and transported together for customer choice; neither route confirms payment.</remarks>
     /// <example><code>var invoice = await charges.CreateTenantAsync(store.Id, sender.Id, chat.Id, amountToman, gateway, token);</code></example>
     public async Task<Invoice> CreateTenantAsync(string botId, long customerId, long chatId, long amount, PaymentGateway gateway, CancellationToken token)
     {
@@ -209,7 +211,8 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
                 workflow.Add(p); await workflow.SaveAsync(token);
                 p.Apply(await CreateTetraminatorAsync(p, token));
                 await workflow.SaveAsync(token);
-                return new(p.PaymentLink, $"tmchk_{p.Id}", notice);
+                return new(p.GetPrimaryPaymentLink(), $"tmchk_{p.Id}", notice + "\n\n" + TetraminatorCustomerPaymentUi.Guidance,
+                    TetraminatorLinks: new(p.PaymentLink, p.GatewayLink));
             }
             case PaymentGateway.UniquePay:
             {

@@ -9790,6 +9790,7 @@ public partial class TelegramBotService
     /// not retried automatically because Tetraminator does not accept a merchant idempotency key. The completed
     /// confirmation state is cleared before the provider request so tapping the old reply-keyboard command again does
     /// not create another invoice from the same owned-bot charge flow.
+    /// Both saved routes are shown in bot-then-online order, with guidance to pay through only one route.
     /// </remarks>
     /// <returns>A task completing after durable invoice preparation, provider creation, and the customer response.</returns>
     private async Task CreateTetraminatorWalletChargeAsync(
@@ -9841,12 +9842,8 @@ public partial class TelegramBotService
             var text = "✅ <b>فاکتور تترامیناتور ساخته شد</b>\n\n" +
                        $"💰 مبلغ: <code>{Html(amount.FormatCurrency())}</code>\n" +
                        $"🧾 شناسه پرداخت: <code>{Html(payment.PayId)}</code>\n\n" +
-                       "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از تایید رسمی درگاه انجام می‌شود.";
-            var keyboard = new InlineKeyboardMarkup(new[]
-            {
-                new[] { InlineKeyboardButton.WithUrl("پرداخت با تترامیناتور | ریالی", payment.PaymentLink) },
-                new[] { InlineKeyboardButton.WithCallbackData("بررسی وضعیت", $"tmchk_{payment.Id}") }
-            });
+                       "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از تایید رسمی درگاه انجام می‌شود.\n\n" + TetraminatorCustomerPaymentUi.Guidance;
+            var keyboard = TetraminatorCustomerPaymentUi.BuildKeyboard(payment.PaymentLink, payment.GatewayLink, $"tmchk_{payment.Id}");
             var sent = await ActiveBotClient.SendMessage(
                 message.Chat.Id,
                 text,
@@ -9893,7 +9890,9 @@ public partial class TelegramBotService
     /// <remarks>
     /// The callback user must own the payment row. The global enable switch is intentionally ignored so invoices
     /// created before an operator disables the gateway can still be settled.
+    /// An unpaid or unavailable inquiry redisplays both saved payment routes without issuing another invoice.
     /// </remarks>
+    /// <returns>A task completing after the ownership-checked inquiry, existing idempotent settlement, or invoice redisplay.</returns>
     private async Task ProcessTetraminatorPaymentCallbackAsync(
         CallbackQuery callbackQuery,
         CancellationToken cancellationToken)
@@ -9918,11 +9917,11 @@ public partial class TelegramBotService
             {
                 await ActiveBotClient.SendMessage(
                     callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
-                    payment.ErrorCode == "provider_not_paid"
+                    (payment.ErrorCode == "provider_not_paid"
                         ? $"پرداخت هنوز تایید نشده است.\nوضعیت: <code>{Html(payment.PaymentStatus)}</code>"
-                        : "اطلاعات پرداخت با فاکتور محلی تطبیق نداشت و هیچ مبلغی به کیف پول اضافه نشد.",
+                        : "اطلاعات پرداخت با فاکتور محلی تطبیق نداشت و هیچ مبلغی به کیف پول اضافه نشد.") + "\n\n" + TetraminatorCustomerPaymentUi.Guidance,
                     parseMode: ParseMode.Html,
-                    replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"tmchk_{payment.Id}") } }),
+                    replyMarkup: TetraminatorCustomerPaymentUi.BuildKeyboard(payment.PaymentLink, payment.GatewayLink, $"tmchk_{payment.Id}"),
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -9948,8 +9947,8 @@ public partial class TelegramBotService
             _logger.LogWarning(ex, "Tetraminator customer inquiry failed. paymentId={PaymentId}, userId={UserId}", payment.Id, callbackQuery.From.Id);
             await ActiveBotClient.SendMessage(
                 callbackQuery.Message?.Chat.Id ?? callbackQuery.From.Id,
-                "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره تلاش کنید.",
-                replyMarkup: new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("بررسی مجدد", $"tmchk_{payment.Id}") } }),
+                "فعلاً امکان استعلام تترامیناتور وجود ندارد. کمی بعد دوباره تلاش کنید.\n\n" + TetraminatorCustomerPaymentUi.Guidance,
+                replyMarkup: TetraminatorCustomerPaymentUi.BuildKeyboard(payment.PaymentLink, payment.GatewayLink, $"tmchk_{payment.Id}"),
                 cancellationToken: cancellationToken);
         }
     }

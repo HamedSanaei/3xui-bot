@@ -61,6 +61,7 @@ public sealed partial class ConcurrencyTests
                 ["success"] = true, ["status"] = true, ["code"] = 200, ["hashId"] = hash, ["refId"] = "fixture-ref",
                 ["data"] = new JObject { ["uid"] = "fixture-id", ["amount"] = 100000, ["payment_url"] = "https://pay.example/" },
                 ["pay_id"] = "fixture-id", ["payment_link"] = "https://pay.example/", ["paymentLink"] = "https://pay.example/",
+                ["gateway_link"] = gateway == PaymentGateway.Tetraminator ? "https://gateway.example/invoice/fixture-id" : null,
                 ["id"] = 1, ["invoice_url"] = "https://pay.example/", ["price_amount"] = 1, ["price_currency"] = "usdtbsc",
                 ["orderId"] = 1, ["trackingCode"] = "fixture-track", ["totalAmountToman"] = 100000,
                 ["cardNumberMasked"] = "****", ["cardNumber"] = "6037999999991234",
@@ -80,6 +81,18 @@ public sealed partial class ConcurrencyTests
             new AtlasPay(config, Client()), new NowPayments(config, Client(), new TenantWalletQuote()));
         var invoice = await charges.CreateTenantAsync("tenant-a", 123, 123, 100000, gateway, default);
         Assert.NotEmpty(invoice.Url); Assert.Equal(1, posts);
+        if (gateway == PaymentGateway.Tetraminator)
+        {
+            // Both links identify ONE invoice; the actual tenant wallet flow must expose bot then online choices,
+            // without affecting the recovery/credit assertions below.
+            Assert.Equal("https://pay.example/", invoice.Url);
+            Assert.NotNull(invoice.TetraminatorLinks);
+            Assert.Equal("https://pay.example/", invoice.TetraminatorLinks.PaymentLink);
+            Assert.Equal("https://gateway.example/invoice/fixture-id", invoice.TetraminatorLinks.GatewayLink);
+            await using var linksDb = databases.Users.CreateDbContext();
+            Assert.Equal(invoice.Url, (await linksDb.TetraminatorPaymentInfos.AsNoTracking().SingleAsync()).PaymentLink);
+            Assert.Equal(invoice.TetraminatorLinks.GatewayLink, (await linksDb.TetraminatorPaymentInfos.AsNoTracking().SingleAsync()).GatewayLink);
+        }
         if (gateway == PaymentGateway.AtlasPay)
         {
             Assert.NotNull(invoice.DirectPayment);

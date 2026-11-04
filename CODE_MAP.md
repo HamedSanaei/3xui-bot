@@ -678,6 +678,11 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   `TetraminatorPaymentInfos` rows live only in `users.db`; `OrderId` and non-null `PayId` are unique. The public GET
   callback is unsigned and therefore only triggers an authoritative `GET /payment/inquiry/{pay_id}`. Settlement
   requires provider `status=true`, exact `payment_status=paid`, exact saved `PayId`, and exact toman amount.
+  `payment_link` and optional `gateway_link` persist separately, displayed in that order through shared
+  `TetraminatorCustomerPaymentUi` buttons plus guidance to pay using ONE link only. Owned/tenant wallet charges,
+  tenant purchase/renewal creation, reuse and unpaid inquiry redisplay share the UI. Inquiry raw JSON cannot erase URLs.
+  `20261104181421_AddTetraminatorGatewayLink` adds nullable GatewayLink with no backfill or financial effect; historical invoices retain their saved link.
+  Missing choices are omitted; primary URL fallback is bot then gateway. Inquiry, settlement and create-no-replay stay unchanged.
 - New Tetraminator invoices require both the global `tetraminatorEnabled` switch and, for tenant storefronts, the
   per-tenant `TenantTetraminatorEnabled` preference. Disabling either switch stops only new tenant invoices; saved
   invoices remain inquiry/settlement eligible so paid customers are not stranded. Invoice creation is never retried

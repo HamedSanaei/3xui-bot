@@ -2507,6 +2507,8 @@ namespace Adminbot.Migrations
 
             modelBuilder.Entity("Adminbot.Domain.TetraminatorPaymentInfo", b =>
                 {
+                    b.Property<string>("GatewayLink").HasColumnType("TEXT");
+
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");

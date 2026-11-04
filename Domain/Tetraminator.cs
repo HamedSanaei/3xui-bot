@@ -29,8 +29,18 @@ public sealed class TetraminatorPaymentInfo
     public string OrderId { get; set; }
     /// <summary>Provider pay id returned by invoice creation and required for authoritative inquiry.</summary>
     public string PayId { get; set; }
-    /// <summary>Provider-hosted payment URL sent to the customer.</summary>
+    /// <summary>Legacy payment_link bot URL, shown first; historical saved URLs are retained without reinterpretation.</summary>
     public string PaymentLink { get; set; }
+    /// <summary>Optional gateway_link online payment URL for the SAME invoice, shown after the bot link.</summary>
+    /// <remarks>Persisted independently because inquiry overwrites RawResponseJson. Null for historical rows; no backfill or financial effect.</remarks>
+    public string GatewayLink { get; set; }
+
+    /// <summary>Gets the first available invoice URL for legacy single-URL consumers without hiding either stored choice.</summary>
+    /// <returns>Nonblank trimmed bot URL, otherwise gateway URL, or null if creation supplied neither.</returns>
+    /// <remarks>Presentation fallback only. Both URLs refer to one PayId; never issue another create to obtain a missing route.</remarks>
+    /// <example><code>order.PaymentUrl = payment.GetPrimaryPaymentLink();</code></example>
+    public string GetPrimaryPaymentLink() => !string.IsNullOrWhiteSpace(PaymentLink) ? PaymentLink.Trim()
+        : !string.IsNullOrWhiteSpace(GatewayLink) ? GatewayLink.Trim() : null;
     /// <summary>Exact expected gross payment amount in Iranian toman.</summary>
     public long AmountToman { get; set; }
     /// <summary>Latest provider payment status; only exact <c>paid</c> is final success.</summary>
@@ -136,13 +146,18 @@ public sealed class TetraminatorPaymentInfo
     /// <summary>
     /// Applies a successful invoice-creation response without changing settlement state.
     /// </summary>
-    /// <param name="response">Provider response containing a stable pay id and Telegram payment link.</param>
+    /// <param name="response">Nullable response for this invoice containing its provider pay id and available payment links; never log its URLs.</param>
+    /// <remarks>Stores bot and gateway URLs independently for owned/tenant wallet charges, purchases and renewals,
+    /// preserving the provider order so the customer chooses ONE route to the same invoice.
+    /// No amount, provider status, wallet, ledger or settlement marker changes. The caller must persist the updated row.</remarks>
+    /// <example><code>payment.Apply(invoice); await workflow.SaveAsync(token); // Display both saved routes.</code></example>
     public void Apply(TetraminatorCreateInvoiceResponse response)
     {
         if (response == null)
             return;
         PayId = response.PayId ?? PayId;
-        PaymentLink = response.PaymentLink ?? PaymentLink;
+        if (!string.IsNullOrWhiteSpace(response.PaymentLink)) PaymentLink = response.PaymentLink.Trim();
+        if (!string.IsNullOrWhiteSpace(response.GatewayLink)) GatewayLink = response.GatewayLink.Trim();
         UpdatedAtUtc = DateTime.UtcNow;
     }
 
@@ -274,8 +289,10 @@ public sealed class Tetraminator
     /// <param name="amountToman">Invoice amount in Iranian toman.</param>
     /// <param name="callbackUrl">Absolute callback URL containing the local order id.</param>
     /// <param name="cancellationToken">Cancellation token for the single non-idempotent HTTP request.</param>
-    /// <returns>A validated response containing non-empty pay id and payment link.</returns>
+    /// <returns>A response with a non-empty pay id and at least one payment URL; callers must display both available choices.</returns>
     /// <exception cref="TetraminatorApiException">Thrown for provider rejection, malformed responses, or transport failure.</exception>
+    /// <remarks>Owned and tenant callers must Apply the response before displaying its saved URLs.
+    /// The provider POST still executes once, even when the response is incomplete or ambiguous. This method never settles money.</remarks>
     public async Task<TetraminatorCreateInvoiceResponse> CreateInvoiceAsync(
         long amountToman,
         string callbackUrl,
@@ -292,7 +309,7 @@ public sealed class Tetraminator
             payload,
             retryInquiry: false,
             cancellationToken);
-        if (response?.Status != true || string.IsNullOrWhiteSpace(response.PayId) || string.IsNullOrWhiteSpace(response.PaymentLink))
+        if (response?.Status != true || string.IsNullOrWhiteSpace(response.PayId) || response.GetPrimaryPaymentLink() == null)
             throw new TetraminatorApiException(0, "Tetraminator returned an incomplete invoice response.");
         return response;
     }
@@ -861,7 +878,7 @@ public sealed class TetraminatorCreateInvoiceRequest
 }
 
 /// <summary>
-/// Successful Tetraminator invoice-creation response.
+/// Tetraminator invoice-creation response with optional online gateway and legacy bot links for the same pay id.
 /// </summary>
 public sealed class TetraminatorCreateInvoiceResponse
 {
@@ -874,9 +891,23 @@ public sealed class TetraminatorCreateInvoiceResponse
     /// <summary>Stable provider payment id required for all later inquiries.</summary>
     [JsonProperty("pay_id")]
     public string PayId { get; set; }
-    /// <summary>Provider-hosted payment URL safe to send to the intended customer.</summary>
+    /// <summary>Legacy Telegram bot payment URL, displayed first without replacing the online gateway choice.</summary>
     [JsonProperty("payment_link")]
     public string PaymentLink { get; set; }
+
+    /// <summary>Optional online gateway URL for this invoice; only returned when the merchant's website gateway is enabled.</summary>
+    /// <remarks>Response-only field, not a database column. Never log this invoice URL or treat its presence as payment confirmation.</remarks>
+    [JsonProperty("gateway_link")]
+    public string GatewayLink { get; set; }
+
+    /// <summary>Gets the first available route for response completeness validation; the UI separately displays both available routes.</summary>
+    /// <returns>The first nonblank PaymentLink/GatewayLink, trimmed; null when neither exists. Intended only for the invoice's payer.</returns>
+    /// <remarks>Pure selection of two routes to the same invoice, without network requests, invoice creation or financial effects.
+    /// Does not change the raw response fields or infer payment success; official pay-id/amount inquiry remains mandatory.</remarks>
+    /// <example><code>var paymentUrl = invoice.GetPrimaryPaymentLink();</code></example>
+    public string GetPrimaryPaymentLink()
+        => !string.IsNullOrWhiteSpace(PaymentLink) ? PaymentLink.Trim()
+            : !string.IsNullOrWhiteSpace(GatewayLink) ? GatewayLink.Trim() : null;
 }
 
 /// <summary>
