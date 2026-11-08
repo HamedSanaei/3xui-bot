@@ -498,7 +498,7 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   explicit Y scales, every weekly/monthly date, adaptive value labels, point markers, and current-versus-previous weekly comparison. It uses
   the embedded OFL-licensed `Assets/Fonts/NotoSans-Regular.ttf`; never fall back to `SKTypeface.Default`, because
   minimal Linux hosts can silently render every chart label blank.
-- `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot.
+- `Services/WeeklyUsageReportHostedService.cs`: Saturday 00:01 Tehran report scheduler, catch-up behavior, users.db claim/lease idempotency, and direct central logger delivery through the default owned bot. Completed reports and live leases are checked read-only; eligible reports still require an atomic claim. SQLite contention before delivery defers the global report to the next poll.
 - `Services/PaymentSettlementNotificationWorker.cs` + `Domain/PaymentSettlementNotification.cs`: delivery-only owned-wallet
   success notification outbox. The first settlement credit and unique outbox row share one users.db save; a 15-second
   worker claims two-minute leases and performs bounded transient Telegram retries without any credentials.db, wallet,

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq.Expressions;
 using Adminbot.Domain;
 using Adminbot.Domain.Logging;
 using Microsoft.EntityFrameworkCore;
@@ -38,7 +39,11 @@ public sealed class UsageReportDispatchStore
     /// <remarks>
     /// Failed generation or delivery attempts release their lease and can be reclaimed later with the same unique
     /// report key. The unique key and atomic update prevent concurrent workers from sending the period together.
+    /// Existing reports that cannot be claimed are checked read-only and never queue for SQLite writer admission.
     /// </remarks>
+    /// <exception cref="ArgumentException">The report key is blank.</exception>
+    /// <exception cref="OperationCanceledException">The caller cancels the claim.</exception>
+    /// <exception cref="Microsoft.Data.Sqlite.SqliteException">SQLite rejects the read or claim, including writer-admission timeout.</exception>
     /// <example>
     /// <code>
     /// if (!await store.TryClaimAsync("weekly:20260718", startUtc, endUtc, cancellationToken))
@@ -55,16 +60,25 @@ public sealed class UsageReportDispatchStore
             throw new ArgumentException("Usage report key is required.", nameof(reportKey));
 
         var now = DateTime.UtcNow;
-        await EnsureRowExistsAsync(reportKey, periodStartUtc, periodEndUtc, now, cancellationToken);
-
         await using var context = _contextFactory.CreateDbContext();
+        var report = context.UsageReportDispatches.Where(x => x.ReportKey == reportKey);
+        Expression<Func<UsageReportDispatch, bool>> canClaim = x =>
+            x.Status == UsageReportDispatchStatuses.Pending ||
+            x.Status == UsageReportDispatchStatuses.Failed ||
+            (x.Status == UsageReportDispatchStatuses.Processing &&
+             (x.LeaseUntilUtc == null || x.LeaseUntilUtc < now));
+
+        // Even a zero-row UPDATE queues for a writer turn. Keep the common completed-report poll read-only.
+        var eligible = await report.Select(canClaim).Select(value => (bool?)value)
+            .SingleOrDefaultAsync(cancellationToken);
+        if (eligible == false)
+            return false;
+        if (eligible == null)
+            await EnsureRowExistsAsync(reportKey, periodStartUtc, periodEndUtc, now, cancellationToken);
+
         var leaseUntil = now.AddMinutes(10);
-        var affected = await context.UsageReportDispatches
-            .Where(x => x.ReportKey == reportKey &&
-                        (x.Status == UsageReportDispatchStatuses.Pending ||
-                         x.Status == UsageReportDispatchStatuses.Failed ||
-                         (x.Status == UsageReportDispatchStatuses.Processing &&
-                          (x.LeaseUntilUtc == null || x.LeaseUntilUtc < now))))
+        // Reapply the same eligibility predicate atomically: the read grants no ownership.
+        var affected = await report.Where(canClaim)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, UsageReportDispatchStatuses.Processing)
                 .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1)
@@ -422,6 +436,8 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
     /// <param name="config">Current application configuration snapshot.</param>
     /// <param name="cancellationToken">Host shutdown token.</param>
     /// <returns>A task that completes after the report is skipped, sent, or recorded for retry.</returns>
+    /// <remarks>Only contention during the users.db claim is deferred to the next scheduled poll without delivery.
+    /// Generation, Telegram delivery and final persistence retain their existing outcome handling.</remarks>
     private async Task TrySendLatestDueReportAsync(AppConfig config, CancellationToken cancellationToken)
     {
         var nowIran = _analytics.GetIranNow();
@@ -431,12 +447,19 @@ public sealed class WeeklyUsageReportHostedService : BackgroundService
         var periodStartUtc = _analytics.ConvertIranTimeToUtc(periodStartIran);
         var periodEndUtc = _analytics.ConvertIranTimeToUtc(periodEndIran);
 
-        if (!await _dispatchStore.TryClaimAsync(
-                reportKey,
-                periodStartUtc,
-                periodEndUtc,
-                cancellationToken))
+        try
         {
+            if (!await _dispatchStore.TryClaimAsync(
+                    reportKey,
+                    periodStartUtc,
+                    periodEndUtc,
+                    cancellationToken))
+                return;
+        }
+        catch (Exception ex) when (SqliteOperation.IsBusy(ex) && !cancellationToken.IsCancellationRequested)
+        {
+            // No report send has started; let the next scheduled poll retry instead of competing again now.
+            _logger.LogDebug("Weekly usage report claim deferred by SQLite contention. reportKey={ReportKey}", reportKey);
             return;
         }
 
