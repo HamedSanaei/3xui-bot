@@ -172,6 +172,7 @@ public class Program
     /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.
     /// TrialAccountLoggingSettings is shared by the super-admin UI and Telegram logger provider; it has no logger dependency
     /// and suppresses only new trial channel audits, retaining local diagnostics and financial backup intents.
+    /// TenantRejectedCourtesyWorker resumes exact-client cleanup after a durable receipt rejection without settling payments.
     /// PhoneVerificationSettings shares one persisted phone requirement across owned sales bots. Tenant flows retain their existing checks.
     /// TenantWeeklyUsageReportHostedService batches storefront-only analytics after Friday midnight Tehran and
     /// delivers owner charts exclusively through scoped Sales Assistant services, independently of the global report flag.
@@ -364,6 +365,7 @@ public class Program
         // Delivery-only workers read users.db outboxes and Telegram; they cannot repeat settlement or XUI mutations.
         services.AddHostedService<PaymentSettlementNotificationWorker>();
         services.AddHostedService<TenantManualReceiptNotificationWorker>();
+        services.AddHostedService<TenantRejectedCourtesyWorker>();
         services.AddHostedService<TenantOrderNotificationWorker>();
         services.AddHostedService<TenantStorefrontFundingAlertWorker>();
         services.AddHostedService<TenantStorefrontFundingMonitorHostedService>();

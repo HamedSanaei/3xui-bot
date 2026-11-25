@@ -222,6 +222,7 @@ public class ApiServicev3
     /// <returns>A verified creation result or a safe unresolved/failed result. An unresolved result never proves non-creation or authorizes another POST.</returns>
     /// <remarks>
     /// Client identity is persisted before POST when a durable operation key is supplied. No SQLite transaction spans HTTP.
+    /// A supplied tenant receipt must still be pending at the durable authorization of a courtesy POST.
     /// A foreground network budget starts after reservation and covers the single POST, GET-only recovery, and optional
     /// detail/link retrieval together. Expiry retains ambiguity unless positive proof exists; positive proof is persisted
     /// independently of the network token and survives unavailable optional links. Caller cancellation still propagates.
@@ -284,7 +285,7 @@ public class ApiServicev3
         if (reservation.Operation.Outcome == XuiV3CreationOutcome.DefinitiveRejected)
             return new XuiV3AccountCreationResult { Success = false, ApiVersion = XuiPanelApiVersion.V3,
                 Message = XuiV3UserSafeError.ForAccountCreation("creation definitively rejected") };
-        if (reservation.MayCreate && await options.OperationStore.TryStartPostAsync(options.OperationKey, cancellationToken))
+        if (reservation.MayCreate && await options.OperationStore.TryStartPostAsync(options.OperationKey, cancellationToken, options.PendingTenantReceiptId))
         {
             try
             {
@@ -3422,6 +3423,10 @@ public class XuiV3ApiException : Exception
 /// </remarks>
 public class XuiV3CreateAccountOptions
 {
+    /// <summary>Optional internal tenant receipt id checked atomically when admitting a courtesy POST.</summary>
+    [JsonIgnore]
+    public int? PendingTenantReceiptId { get; set; }
+
     /// <summary>Optional stable purchase/order-account key; repeated invocations become GET-only recovery.</summary>
     public string OperationKey { get; set; }
     /// <summary>Required durable reservation store when OperationKey is provided; never serialized or logged.</summary>

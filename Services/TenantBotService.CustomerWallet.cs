@@ -25,6 +25,8 @@ public partial class TenantBotService
     /// provider preferences. Personal-card top-ups require restored owner funding before a new receipt order is created.
     /// New order activation and first debit require the live global sale/renewal switch. Exact committed receipts bypass
     /// admission and continue settlement/recovery even when the category, owner funding, or storefront approval later closes.
+    /// Personal-card checkout checks the shared pending slot before displaying deposit details. A local customer block
+    /// prevents new funding admission and leaves previously accepted wallet evidence recoverable.
     /// The wallet home displays only the customer's numeric Telegram id and current balance, retaining charge/history/back actions.
     /// Tetraminator invoices display the saved bot and online routes in that order with single-payment guidance;
     /// the existing inquiry callback remains responsible for ownership and payment verification.</remarks>
@@ -95,6 +97,9 @@ public partial class TenantBotService
             if (parts.Length != 3 || state.Flow != "tenant-wallet-charge" || state.LastStep != "gateway" ||
                 state.SubLink != parts[2] || !long.TryParse(state.ConfigLink, out var amount))
             { await client.SendMessage(chat, "این درخواست منقضی شده است. کیف پول را دوباره باز کنید.", cancellationToken: token); return true; }
+            var refusal = await ReadTenantCardAdmissionRefusalAsync(store.Id, actor, token);
+            if (refusal != null)
+            { await client.SendMessage(chat, refusal, cancellationToken: token); return true; }
             if (!TenantPaymentGatewayPolicy.IsPersonalCardEnabled(store, await GetTenantPaymentAccessAsync(store, token)))
             { await client.SendMessage(chat, "کارت‌به‌کارت شخصی این فروشگاه در حال حاضر فعال نیست.", cancellationToken: token); return true; }
             await _state.ClearUserStatus(state);
@@ -108,6 +113,8 @@ public partial class TenantBotService
             if (parts.Length != 4 || state.Flow != "tenant-wallet-charge" || state.LastStep != "gateway" || state.SubLink != parts[3]
                 || !int.TryParse(parts[2], out var gateway) || !long.TryParse(state.ConfigLink, out var amount))
             { await client.SendMessage(chat, "این درخواست منقضی شده است. کیف پول را دوباره باز کنید.", cancellationToken: token); return true; }
+            if (await _workflow.ReadAsync(db => TenantCustomerAdmission.IsBlockedAsync(db, store.Id, actor, token)))
+                throw new TenantCustomerBlockedException();
             // Consume before the non-idempotent provider create. A replay cannot issue another invoice.
             await _state.ClearUserStatus(state);
             try

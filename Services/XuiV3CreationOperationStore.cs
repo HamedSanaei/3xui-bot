@@ -81,12 +81,22 @@ public sealed class XuiV3CreationOperationStore
     /// <summary>Atomically grants exactly one POST authorization for an unused reservation.</summary>
     /// <param name="key">Immutable business operation key already reserved in users.db; required.</param>
     /// <param name="token">Cancellation before crossing the external mutation boundary.</param>
+    /// <param name="pendingTenantReceiptId">Optional internal receipt id that must still authorize the same tenant order's courtesy POST.</param>
     /// <returns>True only to the caller that durably changed Reserved to PostStarted; false forbids POST.</returns>
-    /// <remarks>A crash after this commit is uncertain even if HTTP was never sent. No timeout or terminal state resets this grant.</remarks>
-    public Task<bool> TryStartPostAsync(string key, CancellationToken token) => SqliteOperation.RunAsync(async ct =>
+    /// <remarks>A crash after this commit is uncertain even if HTTP was never sent. The receipt check and POST admission are one SQL write, ordered relative to owner review.</remarks>
+    public Task<bool> TryStartPostAsync(string key, CancellationToken token, int? pendingTenantReceiptId = null) => SqliteOperation.RunAsync(async ct =>
     {
         await using var db = _factory.CreateDbContext();
-        return await db.XuiV3CreationOperations.Where(x => x.OperationKey == key && x.Outcome == XuiV3CreationOutcome.Reserved)
+        var eligible = db.XuiV3CreationOperations.Where(x => x.OperationKey == key && x.Outcome == XuiV3CreationOutcome.Reserved);
+        if (pendingTenantReceiptId.HasValue)
+            eligible = eligible.Where(x => db.TenantBotOrders.Any(o =>
+                x.OperationKey == "tenant-card-provisional-create:" + o.OrderId && o.ManualReceiptId == pendingTenantReceiptId &&
+                o.CustomerTelegramUserId == x.TelegramUserId && o.PaymentProvider == "tenant_card" && !o.IsFulfilled &&
+                o.ProvisionalDeliveryState == TenantCardProvisionalStates.Provisioning &&
+                db.TenantManualPaymentReceipts.Any(r => r.Id == pendingTenantReceiptId && r.TenantBotOrderId == o.Id &&
+                    r.TenantBotId == o.TenantBotId && r.CustomerTelegramUserId == o.CustomerTelegramUserId &&
+                    r.Status == TenantManualPaymentReceiptStatuses.Pending && r.PhotoFileId != null && r.PhotoFileId.Trim() != "")));
+        return await eligible
             .ExecuteUpdateAsync(set => set.SetProperty(x => x.Outcome, XuiV3CreationOutcome.PostStarted)
                 .SetProperty(x => x.PostStartedAtUtc, DateTime.UtcNow), ct) == 1;
     }, token);

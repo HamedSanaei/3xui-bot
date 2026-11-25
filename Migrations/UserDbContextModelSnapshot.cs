@@ -8,7 +8,7 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace Adminbot.Migrations
 {
-    /// <summary>Current users.db model including additive provisional reviewed-recovery audit and mutation-boundary fields.</summary>
+    /// <summary>Current users.db model including tenant receipt lookup and storefront customer restrictions.</summary>
     [DbContext(typeof(UserDbContext))]
     partial class UserDbContextModelSnapshot : ModelSnapshot
     {
@@ -2161,6 +2161,29 @@ namespace Adminbot.Migrations
                     b.ToTable("TenantDebtTransfer");
                 });
 
+            modelBuilder.Entity("Adminbot.Domain.TenantCustomerBlock", b =>
+                {
+                    b.Property<string>("TenantBotId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("CustomerTelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("BlockedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("BlockedByTelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("ReceiptId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("TenantBotId", "CustomerTelegramUserId");
+
+                    b.ToTable("TenantCustomerBlocks", (string)null);
+                });
+
             modelBuilder.Entity("Adminbot.Domain.TenantManualPaymentReceipt", b =>
                 {
                     b.Property<int>("Id")
@@ -2234,6 +2257,8 @@ namespace Adminbot.Migrations
                     b.HasIndex("TenantBotId");
 
                     b.HasIndex("TenantBotOrderId");
+
+                    b.HasIndex("TenantBotId", "CustomerTelegramUserId", "Status");
 
                     b.ToTable("TenantManualPaymentReceipts", (string)null);
                 });

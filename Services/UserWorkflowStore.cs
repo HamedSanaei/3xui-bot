@@ -1,4 +1,5 @@
 using System.Collections;
+using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 
@@ -88,8 +89,10 @@ public sealed class UserWorkflowStore
     /// All changed rows commit atomically in users.db. No network calls occur inside the transaction. Only BUSY/LOCKED
     /// retries, at most three fresh-context attempts, are allowed. Conflict or validation failures never retry.
     /// The caller must abort or deliberately reload/re-evaluate a conflicting business workflow, not resend external I/O.
+    /// New tenant orders also recheck the storefront's customer block in this transaction before insertion.
     /// </remarks>
     /// <exception cref="DbUpdateConcurrencyException">A row was removed or changed since its snapshot was read.</exception>
+    /// <exception cref="TenantCustomerBlockedException">A new tenant order belongs to a customer blocked in that storefront.</exception>
     /// <example><code>order.ErrorMessage = safeFailure; await store.SaveAsync(token);</code></example>
     public async Task<int> SaveAsync(CancellationToken token = default)
     {
@@ -107,6 +110,8 @@ public sealed class UserWorkflowStore
                 object target;
                 if (snapshot.Original == null)
                 {
+                    if (snapshot.Entity is TenantBotOrder newOrder)
+                        await TenantCustomerAdmission.RequireUnblockedAsync(db, newOrder, ct);
                     target = Activator.CreateInstance(snapshot.Type.ClrType)!;
                     Copy(snapshot.Type, edit.Values, target);
                     db.Add(target);

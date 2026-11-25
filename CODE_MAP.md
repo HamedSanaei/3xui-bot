@@ -1,5 +1,13 @@
 # CODE_MAP.md
 
+- Tenant personal-card receipts: the receipt/outbox writer serializes a single pending image per
+  `(TenantBotId, CustomerTelegramUserId)` across purchase, renewal and wallet charge. Existing duplicate pending images
+  remain reviewable. The same check runs before card instructions. Audit-only rows and completed decisions are outside the slot.
+- `TenantCustomerBlocks` uses the same composite scope. Sales Assistant **رد رسید و مسدودسازی** commits both decisions
+  atomically. The current owner can lift the exact block from order details. Accepted payments continue settling.
+  Courtesy POST authorization checks the exact pending receipt. `TenantRejectedCourtesyWorker` resumes exact-client
+  revocation after interruption. Migration `20261125064400_AddTenantCustomerBlocksAndReceiptLookup` preserves financial rows.
+
 - Owned phone verification: `PhoneVerificationSettings` persists the shared, live `ownedPhoneVerificationRequired`
   root boolean in `Data/configuration.json` (default on). Only the private owned-bot super-admin panel can change it.
   Owned `/start`, `/refresh` and join/menu entry check it after mandatory membership; existing XUI purchase, renewal

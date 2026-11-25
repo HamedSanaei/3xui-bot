@@ -281,6 +281,7 @@ public class SalesAssistantService
     /// <remarks>
     /// the generated inline keyboard uses A two-step Approval Flow: APPROVE first, then final confirmation.
     /// final confirmation DELEGATES to <see cref="TenantBotService.APPROVEMANUALRECEIPTASYNC" />.
+    /// The combined rejection and local customer block has a separate confirmation and never settles money.
     /// the receipt photo is first DOWNLOADED through the tenant Bot that received it and then UPLOADED Again
     /// through the sales assistant Bot because Telegram file IDENTIFIERS are not safely REUSABLE across bots.
     /// Known pre-dispatch endpoint fences propagate to the durable receipt worker instead of sending fallback text.
@@ -327,7 +328,8 @@ public class SalesAssistantService
             new[]
             {
                 InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAIL:{receipt.Id}")
-            }
+            },
+            new[] { InlineKeyboardButton.WithCallbackData("رد رسید و مسدودسازی", CALLBACKPREFIX + $"BLOCK:{receipt.Id}") }
         });
 
         var photoSendInvoked = false;
@@ -437,7 +439,7 @@ public class SalesAssistantService
     }
 
     /// <summary>
-    /// routes assistant inline callbacks for receipt Approval, Cancellation, final confirmation, or rejection.
+    /// Routes Sales Assistant receipt review, including the confirmed combination of rejection and storefront blocking.
     /// </summary>
     /// <param name="botClient">assistant Bot client used to answer and edit the callback Message.</param>
     /// <param name="CallbackQuery">Incoming assistant callback Query.</param>
@@ -445,6 +447,7 @@ public class SalesAssistantService
     /// <remarks>
     /// final confirmation is idempotent through the tenant order fulfillment service. REPEATED CLICKS do not
     /// Create another account or another ledger entry when the order is already fulfilled.
+    /// The tenant writer rechecks exact owner, store and pending evidence for a combined rejection and restriction.
     /// </remarks>
     /// <returns>A task completing after the authorized receipt action and its Telegram response.</returns>
     private async Task HANDLECALLBACKASYNC(ITelegramBotClient botClient, CallbackQuery CallbackQuery, CancellationToken CancellationToken)
@@ -517,7 +520,15 @@ public class SalesAssistantService
         if (parts[0] == "final")
         {
             var TENANTSERVICE = _serviceProvider.GetRequiredService<TenantBotService>();
-            var result = await TENANTSERVICE.APPROVEMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
+            string result;
+            try
+            {
+                result = await TENANTSERVICE.APPROVEMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                result = "وضعیت رسید تغییر کرده است. جزئیات رسید را دوباره بررسی کنید.";
+            }
             var canResend = await IsReceiptOrderFulfilledAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
             var canApprove = !canResend && await CanRetryReceiptApprovalAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, result, showAlert: true, cancellationToken: CancellationToken);
@@ -530,13 +541,46 @@ public class SalesAssistantService
             return;
         }
 
-        if (parts[0] == "REJECT")
+        if (parts[0] is "BLOCK" or "BLOCKCANCEL")
+        {
+            var mayReview = CallbackQuery.Message?.Chat.Id == CallbackQuery.From.Id &&
+                await _workflow.ReadAsync(db => db.TenantManualPaymentReceipts.AnyAsync(x => x.Id == RECEIPTID &&
+                    x.OwnerTelegramUserId == CallbackQuery.From.Id && x.Status == TenantManualPaymentReceiptStatuses.Pending &&
+                    x.PhotoFileId != null && x.PhotoFileId != "", CancellationToken));
+            if (!mayReview)
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "این رسید دیگر در انتظار بررسی شما نیست.", showAlert: true, cancellationToken: CancellationToken);
+                return;
+            }
+
+            var confirm = parts[0] == "BLOCK";
+            var keyboard = confirm ? new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("تأیید رد و مسدودسازی در همین فروشگاه", CALLBACKPREFIX + $"BLOCKFINAL:{RECEIPTID}") },
+                new[] { InlineKeyboardButton.WithCallbackData("انصراف", CALLBACKPREFIX + $"BLOCKCANCEL:{RECEIPTID}") }
+            }) : BuildReceiptPostReviewKeyboard(RECEIPTID, canResend: false, canApprove: true);
+            await SafeEditMessageReplyMarkupAsync(botClient, CallbackQuery.Message.Chat.Id, CallbackQuery.Message.MessageId, keyboard, CancellationToken);
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id,
+                confirm ? "این اقدام رسید را رد می‌کند و سفارش و رسید تازه را برای این مشتری در همین فروشگاه می‌بندد." : "لغو شد.",
+                showAlert: confirm, cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (parts[0] is "REJECT" or "BLOCKFINAL")
         {
             // Delegated so a rejected receipt also disables any provisional courtesy client through the order's own
             // durable revoke saga. Owner authorization is rechecked inside the tenant service, so an assistant-side
             // callback cannot bypass it. Nothing here settles money in either direction.
             var TENANTSERVICE = _serviceProvider.GetRequiredService<TenantBotService>();
-            var REJECTRESULT = await TENANTSERVICE.REJECTMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
+            if (parts[0] == "BLOCKFINAL" && CallbackQuery.Message?.Chat.Id != CallbackQuery.From.Id)
+            {
+                await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "تأیید مسدودی فقط در گفت‌وگوی خصوصی انجام می‌شود.",
+                    showAlert: true, cancellationToken: CancellationToken);
+                return;
+            }
+            var REJECTRESULT = parts[0] == "BLOCKFINAL"
+                ? await TENANTSERVICE.RejectAndBlockManualReceiptAsync(RECEIPTID, CallbackQuery.From.Id, CancellationToken)
+                : await TENANTSERVICE.REJECTMANUALRECEIPTASYNC(RECEIPTID, CallbackQuery.From.Id, CancellationToken);
 
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, REJECTRESULT, showAlert: true, cancellationToken: CancellationToken);
             await SafeEditMessageReplyMarkupAsync(
@@ -561,6 +605,7 @@ public class SalesAssistantService
     /// <remarks>
     /// Pending receipts must keep approval controls even after the owner opens details. Otherwise the owner
     /// loses the ability to finish a valid receipt from the same assistant message.
+    /// The separate reject-and-block button opens confirmation and rechecks pending evidence before enabling a decision.
     /// </remarks>
     private static InlineKeyboardMarkup BuildReceiptPostReviewKeyboard(int receiptId, bool canResend, bool canApprove = false)
     {
@@ -573,6 +618,7 @@ public class SalesAssistantService
                 InlineKeyboardButton.WithCallbackData("✅ تایید", CALLBACKPREFIX + $"APPROVE:{receiptId}"),
                 InlineKeyboardButton.WithCallbackData("❌ رد", CALLBACKPREFIX + $"REJECT:{receiptId}")
             });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("رد رسید و مسدودسازی", CALLBACKPREFIX + $"BLOCK:{receiptId}") });
         }
 
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔎 مشاهده جزئیات", CALLBACKPREFIX + $"DETAIL:{receiptId}") });

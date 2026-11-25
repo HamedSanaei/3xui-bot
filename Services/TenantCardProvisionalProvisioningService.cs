@@ -210,6 +210,7 @@ namespace Adminbot.Services
         /// Global sale closure blocks unstarted courtesy provisioning, including Reserved-only operations. Started,
         /// applied and ambiguous operations retain their original exactly-once recovery path regardless of closure.
         /// </remarks>
+        /// <param name="pendingReceiptId">Exact accepted users.db receipt id for a live tenant upload. When supplied it must still be pending at the durable POST claim.</param>
         /// <example>
         /// <code>
         /// var provisional = await provisioning.ProvisionAsync(customer, panel, order.Id, cancellationToken);
@@ -221,7 +222,8 @@ namespace Adminbot.Services
             CredUser customer,
             ServerInfo serverInfo,
             int tenantBotOrderId,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            int? pendingReceiptId = null)
         {
             if (customer == null)
                 throw new ArgumentNullException(nameof(customer));
@@ -231,6 +233,8 @@ namespace Adminbot.Services
             var order = await LoadOrderAsync(tenantBotOrderId, cancellationToken).ConfigureAwait(false);
             if (order == null)
                 return Failure(TenantCardProvisionalProvisioningStatus.NotApplicable, tenantBotOrderId, null, "provisional_order_not_found");
+            if (pendingReceiptId.HasValue && !await IsPendingReceiptAsync(order.Id, pendingReceiptId.Value, cancellationToken))
+                return Failure(TenantCardProvisionalProvisioningStatus.NotApplicable, order.Id, order.OrderId, "provisional_receipt_decided");
 
             // The global switch is read live so an operator change takes effect without restarting the process.
             if (!(_configuration.Get<AppConfig>()?.TenantCardProvisionalDeliveryEnabled ?? false))
@@ -275,7 +279,7 @@ namespace Adminbot.Services
 
             // Durable claim before the first mutation, so a crash between the claim and the POST is resumable rather than
             // invisible. A concurrent caller that loses the claim simply resumes the same operation key.
-            await ClaimProvisioningAsync(order.Id, cancellationToken).ConfigureAwait(false);
+            await ClaimProvisioningAsync(order.Id, pendingReceiptId, cancellationToken).ConfigureAwait(false);
 
             XuiV3ProvisionalPlacement placement;
             try
@@ -298,6 +302,9 @@ namespace Adminbot.Services
 
             if (!started && !_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
                 return Failure(TenantCardProvisionalProvisioningStatus.Disabled, order.Id, order.OrderId, "service_sale_disabled");
+            // Review may have completed while the placement was being resolved. No pending receipt authorizes a new attempt after that decision.
+            if (pendingReceiptId.HasValue && !await IsPendingReceiptAsync(order.Id, pendingReceiptId.Value, cancellationToken))
+                return Failure(TenantCardProvisionalProvisioningStatus.NotApplicable, order.Id, order.OrderId, "provisional_receipt_decided");
             var created = await _purchaseService.CreateAccountWithExplicitLimitsAsync(
                 customer,
                 serverInfo,
@@ -309,6 +316,7 @@ namespace Adminbot.Services
                 metadataOptions: new XuiV3AccountMetadataOptions
                 {
                     OperationKey = BuildCreateOperationKey(order.OrderId),
+                    PendingTenantReceiptId = pendingReceiptId,
                     UserComment = $"provisional tenant card courtesy VIA @{order.TenantBotUsername}; Buyer={order.CustomerTelegramUserId}; tenant={order.TenantBotId}",
                     PlanKeyOverride = ProvisionalPlanKey,
                     PlanNameOverride = "Provisional 1GB / 1 day",
@@ -352,6 +360,17 @@ namespace Adminbot.Services
                 ProvisionalDurationDays,
                 null,
                 CreatedNow: true);
+        }
+
+        /// <summary>Rechecks the exact submitted receipt before admitting courtesy provisioning.</summary>
+        /// <param name="orderId">Internal users.db id of the purchase order.</param>
+        /// <param name="receiptId">Internal id returned by the committed receipt writer.</param>
+        /// <param name="token">Cancellation of the short database query.</param>
+        /// <returns>True while the specific receipt is still pending and still linked to the order.</returns>
+        private async Task<bool> IsPendingReceiptAsync(int orderId, int receiptId, CancellationToken token)
+        {
+            await using var db = _factory.CreateDbContext();
+            return await TenantCustomerAdmission.IsPendingReceiptAsync(db, orderId, receiptId, token).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -499,17 +518,22 @@ namespace Adminbot.Services
         /// Atomically moves the order from "no attempt" to <c>provisioning</c> before any panel mutation.
         /// </summary>
         /// <param name="orderId">Internal order id being claimed.</param>
+        /// <param name="pendingReceiptId">Optional exact tenant receipt id required to put a new courtesy order into provisioning.</param>
         /// <param name="cancellationToken">Cancellation token for the short update.</param>
         /// <returns>A task completing after the guarded update. Losing the race is not an error.</returns>
         /// <remarks>
         /// The guard on <c>none</c> means a concurrent caller can never re-open an order that another attempt already
         /// claimed, which is the durable half of the at-most-once courtesy grant.
         /// </remarks>
-        private async Task ClaimProvisioningAsync(int orderId, CancellationToken cancellationToken)
+        private async Task ClaimProvisioningAsync(int orderId, int? pendingReceiptId, CancellationToken cancellationToken)
         {
             await using var db = _factory.CreateDbContext();
-            await db.TenantBotOrders
-                .Where(x => x.Id == orderId && x.ProvisionalDeliveryState == TenantCardProvisionalStates.None)
+            var eligible = db.TenantBotOrders.Where(x => x.Id == orderId && x.ProvisionalDeliveryState == TenantCardProvisionalStates.None);
+            if (pendingReceiptId.HasValue)
+                eligible = eligible.Where(o => o.ManualReceiptId == pendingReceiptId && !o.IsFulfilled &&
+                    db.TenantManualPaymentReceipts.Any(r => r.Id == pendingReceiptId && r.TenantBotOrderId == o.Id &&
+                        r.Status == TenantManualPaymentReceiptStatuses.Pending));
+            await eligible
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.ProvisionalDeliveryState, TenantCardProvisionalStates.Provisioning)
                     .SetProperty(x => x.ProvisionalErrorCode, (string)null)

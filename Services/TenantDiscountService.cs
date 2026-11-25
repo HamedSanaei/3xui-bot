@@ -771,7 +771,8 @@ public sealed class TenantDiscountService
     /// <param name="provider">Persisted first payment provider or pending renewal choice.</param>
     /// <param name="token">Cancellation of the users.db insert and claim.</param>
     /// <returns>The tracked inserted order, or a named identity/store failure or Disabled when global admission is closed or its policy is missing.</returns>
-    /// <remarks>Rechecks the live global sale/renewal switch immediately before insertion. Existing invoice/receipt recovery never calls this new-order primitive, so accepted money is not stranded by closure.</remarks>
+    /// <remarks>Rechecks the live sale/renewal switch and local customer block before insertion. Existing invoice/receipt recovery never calls this new-order primitive.</remarks>
+    /// <exception cref="TenantCustomerBlockedException">The authenticated customer was blocked in this storefront.</exception>
     private async Task<TenantDiscountResult<TenantBotOrder>> InsertOrderAsync(UserDbContext db,
         TenantBotOrder order, TenantDiscountCode code, TenantDiscountPrice price, string provider, CancellationToken token)
     {
@@ -799,6 +800,7 @@ public sealed class TenantDiscountService
             string.IsNullOrWhiteSpace(order.UnlimitedPlanKey) ? null : XuiV3ServiceKinds.Unlimited);
         if (_salesAvailability == null || !_salesAvailability.Snapshot.IsEnabled(category, operation))
             return TenantDiscountResult<TenantBotOrder>.Fail(TenantDiscountFailure.Disabled);
+        await TenantCustomerAdmission.RequireUnblockedAsync(db, order, token);
         db.TenantBotOrders.Add(order);
         await db.SaveChangesAsync(token);
         if (code != null)

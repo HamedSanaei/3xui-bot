@@ -1331,7 +1331,7 @@ public class XuiV3PurchaseService
     ///
     /// Side effects: one panel client is created through the same Reserve / single-POST / Applied-or-Ambiguous boundary as
     /// <see cref="CreateAccountAsync" />. No wallet debit, ledger entry, order mutation, or Telegram send happens here;
-    /// callers own financial settlement and customer delivery.
+    /// callers own financial settlement and customer delivery. An optional pending tenant receipt conditions the initial POST claim.
     /// </remarks>
     /// <example>
     /// <code>
@@ -1348,7 +1348,8 @@ public class XuiV3PurchaseService
     ///     cancellationToken: cancellationToken,
     ///     metadataOptions: new XuiV3AccountMetadataOptions
     ///     {
-    ///         OperationKey = $"tenant-card-provisional-create:{order.Id}",
+    ///         OperationKey = TenantCardProvisionalProvisioningService.BuildCreateOperationKey(order.OrderId),
+    ///         PendingTenantReceiptId = acceptedReceiptId,
     ///         PlanKeyOverride = "provisional-1gb-1d",
     ///         PriceTomanOverride = 0,
     ///         SaveUserStatus = false
@@ -1434,6 +1435,7 @@ public class XuiV3PurchaseService
                 DurationDays = durationDays,
                 LimitIp = 0,
                 StartExpiryAfterFirstUse = false,
+                PendingTenantReceiptId = metadataOptions.PendingTenantReceiptId,
                 Comment = BuildClientComment(user, resolved, inboundIds, serverInfo, metadataOptions, trafficBytes, priceToman),
                 SaveUserStatus = metadataOptions.SaveUserStatus
             },
@@ -2244,6 +2246,9 @@ public sealed class XuiV3ProvisionalPlacement
 
 public class XuiV3AccountMetadataOptions
 {
+    /// <summary>Optional internal receipt id required to authorize initial courtesy creation for its tenant order.</summary>
+    public int? PendingTenantReceiptId { get; set; }
+
     /// <summary>Stable order/account creation key; repeated invocation can only recover the original client by GET.</summary>
     public string OperationKey { get; set; }
     /// <summary>

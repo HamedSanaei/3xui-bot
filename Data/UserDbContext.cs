@@ -82,6 +82,8 @@ public class UserDbContext : DbContext
     /// <summary>Retryable referral reward rows linked to exactly-once wallet mutations and ledger entries.</summary>
     public DbSet<ReferralReward> ReferralRewards { get; set; }
     public DbSet<TenantManualPaymentReceipt> TenantManualPaymentReceipts { get; set; }
+    /// <summary>Active storefront-specific restrictions, keyed by the internal bot id and customer Telegram id.</summary>
+    public DbSet<TenantCustomerBlock> TenantCustomerBlocks { get; set; }
     /// <summary>Durable outbox intents that relay tenant receipt photos to the Sales Assistant outside update lanes.</summary>
     public DbSet<TenantManualReceiptNotification> TenantManualReceiptNotifications { get; set; }
     /// <summary>Durable post-fulfillment Telegram delivery intents keyed by tenant order and notification kind.</summary>
@@ -181,6 +183,8 @@ public class UserDbContext : DbContext
     /// Explicit false is an owner opt-out, preserved by runtime mapping and storefront reset; no customer/financial schema changes.
     /// Endpoint routing uses exact BotId plus BotFather identity, CAS Revision and separate operator ControlRevision.
     /// Endpoint history has no cascading foreign keys; independent alert intents deduplicate per incident and global superadmin.
+    /// Active customer restrictions use the storefront/customer composite key, with logical links to the bot and source receipt.
+    /// The pending receipt lookup is nonunique to retain existing receipt evidence. No restrictions are inferred during migration.
     /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -630,6 +634,13 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.ReferralRelationshipId);
         });
 
+        modelBuilder.Entity<TenantCustomerBlock>(entity =>
+        {
+            entity.ToTable("TenantCustomerBlocks");
+            entity.HasKey(x => new { x.TenantBotId, x.CustomerTelegramUserId });
+            entity.Property(x => x.TenantBotId).HasMaxLength(64);
+        });
+
         modelBuilder.Entity<TenantManualPaymentReceipt>(entity =>
         {
             entity.ToTable("TenantManualPaymentReceipts");
@@ -645,6 +656,8 @@ public class UserDbContext : DbContext
             entity.HasIndex(x => x.OwnerTelegramUserId);
             entity.HasIndex(x => x.CustomerTelegramUserId);
             entity.HasIndex(x => x.Status);
+            // This stays nonunique so already-submitted receipt evidence survives the migration.
+            entity.HasIndex(x => new { x.TenantBotId, x.CustomerTelegramUserId, x.Status });
         });
 
         modelBuilder.Entity<TenantManualReceiptNotification>(entity =>
