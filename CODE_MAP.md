@@ -368,6 +368,8 @@ Adminbot is a multi-brand Telegram sales bot for XUI/3x-ui VPN accounts. It supp
   clean exact SHA, complete Release build/discovery/test run with explicit TRX proof, both EF model checks,
   application-only linux-x64 publish, assets and fresh published migration preflight. `45fc9c5`'s explicit
   failure propagation is retained; bounded commands do not rely on conditional-subshell errexit.
+  The historical tenant-wallet downgrade regression seeds paid evidence at its old migration boundary instead
+  of invoking current storefront admission, which requires the later `TenantCustomerBlocks` table.
   `scripts/release-artifact.py` binds the data-free runtime archive to commit/runtime and file checksums/modes.
   Actions proves upload/exact-ID download/checksum round trip on every verification; Production verifies again
   and runs only copy-only live-database migration preflight before protected runtime rsync/restart.
