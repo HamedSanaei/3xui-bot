@@ -76,8 +76,8 @@ public partial class TelegramBotService
     /// <param name="cancellationToken">Cancellation token for Telegram and provider work.</param>
     /// <returns>A task that completes after the link or a friendly notice has been sent.</returns>
     /// <remarks>
-    /// The callback is acknowledged first so the customer's client does not spin while GitHub is queried, then the live
-    /// global switch is re-checked, so a stale inline button fails closed without any provider request.
+    /// The live switch is checked before and after acknowledgement, so disabling downloads from the guide or
+    /// standalone menu prevents a stale button from starting a release lookup.
     /// </remarks>
     private async Task HandleClientDownloadPlatformCallbackAsync(
         ITelegramBotClient botClient,
@@ -97,6 +97,7 @@ public partial class TelegramBotService
         }
 
         await SafeAnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
+        if (!_clientDownloadAvailability.Snapshot.Enabled) return;
         await ClientDownloadFlow.SendPlatformResultAsync(
             botClient,
             chatId,

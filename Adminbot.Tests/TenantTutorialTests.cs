@@ -572,7 +572,7 @@ public sealed partial class ConcurrencyTests
     }
 
     /// <summary>
-    /// Proves both customer installation-guide aliases produce exactly the three built-in category buttons.
+    /// Proves both legacy tenant aliases still reach the shared connection guide for the three installed platforms.
     /// </summary>
     /// <remarks>
     /// The aliases are asserted through the real recognition predicate, and the rendered keyboard is asserted through the
@@ -584,8 +584,6 @@ public sealed partial class ConcurrencyTests
         using var databases = new Databases();
         await using var provider = StorefrontProvider(databases);
         var client = new StorefrontClient();
-        var tenant = new BotInstance { Id = "tenant-tutorial-menu", Type = BotInstanceTypes.Tenant, Enabled = true };
-
         await using var scope = provider.CreateAsyncScope();
         var service = scope.ServiceProvider.GetRequiredService<TenantBotService>();
         var isTutorialCommand = typeof(TenantBotService).GetMethod("IsTenantTutorialCommand", BindingFlags.Static | BindingFlags.NonPublic)!;
@@ -593,17 +591,17 @@ public sealed partial class ConcurrencyTests
         Assert.True((bool)isTutorialCommand.Invoke(null, new object[] { "💡راهنما نصب" })!);
 
         var sendMenu = typeof(TenantBotService).GetMethod("SendTenantTutorialsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await (Task)sendMenu.Invoke(service, new object[] { client, new ChatId(722), tenant, CancellationToken.None })!;
+        await (Task)sendMenu.Invoke(service, new object[] { client, new ChatId(722), CancellationToken.None })!;
 
         // Exactly three category buttons, one per row, addressed by the three built-in tutorial kinds.
         Assert.Equal(3, client.Labels.Count);
         Assert.Contains("Android", client.Labels[0]);
         Assert.Contains("iOS", client.Labels[1]);
-        Assert.Contains("ویندوز", client.Labels[2]);
+        Assert.Contains("Windows", client.Labels[2]);
         Assert.Equal(
-            new[] { "TN:tutorial:android", "TN:tutorial:ios", "TN:tutorial:windows" },
+            new[] { "TN:guide:android", "TN:guide:ios", "TN:guide:windows" },
             client.Callbacks.ToArray());
-        Assert.Contains("آموزش نصب", client.Texts[0]);
+        Assert.Contains("راهنمای اتصال", client.Texts[0]);
     }
 
     /// <summary>

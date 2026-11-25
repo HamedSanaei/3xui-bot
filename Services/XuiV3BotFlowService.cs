@@ -1,4 +1,5 @@
 using Adminbot.Domain;
+using Adminbot.Services;
 using Adminbot.Utils;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -111,6 +112,8 @@ public partial class XuiV3BotFlowService
     private readonly TelegramInteractionTimeouts _interactionTimeouts;
     /// <summary>Live owned-bot phone preference. Existing tenant checks remain mandatory.</summary>
     private readonly PhoneVerificationSettings _phoneVerification;
+    /// <summary>Live global download switch used only to label the owned purchase guide button.</summary>
+    private readonly IClientDownloadAvailability _clientDownloadAvailability;
 
     /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
@@ -161,6 +164,7 @@ public partial class XuiV3BotFlowService
     /// <param name="trialCreationOperations">Required shared panel creation evidence store; preserves funded paid-test recovery and started owned-batch settlement across later global sales closure.</param>
     /// <param name="appConfig">Required singleton startup options supplying the nonnegative colleague daily free-test count; not rebound per Telegram execution.</param>
     /// <param name="phoneVerification">Optional live phone policy for owned sales bots. Without it, existing phone checks require a verified number.</param>
+    /// <param name="clientDownloadAvailability">Optional live global switch for purchase delivery. Null shows the guide without downloads.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
     /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value is never read
@@ -189,7 +193,8 @@ public partial class XuiV3BotFlowService
         XuiV3CreationOperationStore trialCreationOperations,
         AppConfig appConfig,
         TelegramInteractionTimeouts interactionTimeouts = null,
-        PhoneVerificationSettings phoneVerification = null)
+        PhoneVerificationSettings phoneVerification = null,
+        IClientDownloadAvailability clientDownloadAvailability = null)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -210,6 +215,7 @@ public partial class XuiV3BotFlowService
         _colleagueDailyFreeTrialLimit = appConfig.ColleagueDailyFreeTrialLimit;
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
         _phoneVerification = phoneVerification;
+        _clientDownloadAvailability = clientDownloadAvailability;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -4062,6 +4068,7 @@ public partial class XuiV3BotFlowService
     /// after closure, while new and merely Reserved work is rejected before provisioning.
     /// Successful creates enqueue their website mirror locally with deferred send; website outages cannot delay
     /// customer account delivery or make a completed creation depend on a remote ownership lookup.
+    /// Each newly purchased account's QR or text message includes a connection guide action, with no release lookup during settlement or delivery.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
     /// Propagated when <paramref name="cancellationToken"/> is cancelled during Telegram, database, or panel work.
@@ -5182,6 +5189,8 @@ public partial class XuiV3BotFlowService
                             deferSend: true));
 
                     var createdAccountText = _purchaseService.BuildCreatedAccountText(createdAccount);
+                    var connectionGuide = ConnectionGuideFlow.BuildPurchaseMarkup(ConnectionGuideFlow.OwnedPrefix,
+                        _clientDownloadAvailability?.Snapshot.Enabled == true);
                     if (!string.IsNullOrWhiteSpace(createdAccount.SubLink))
                     {
                         using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(createdAccount.SubLink, 200));
@@ -5190,6 +5199,7 @@ public partial class XuiV3BotFlowService
                             photo: InputFile.FromStream(qrStream, "subscription-qr.png"),
                             caption: createdAccountText,
                             parseMode: ParseMode.Html,
+                            replyMarkup: connectionGuide,
                             cancellationToken: cancellationToken);
                     }
                     else
@@ -5198,6 +5208,7 @@ public partial class XuiV3BotFlowService
                             chatId: chatId,
                             text: createdAccountText,
                             parseMode: ParseMode.Html,
+                            replyMarkup: connectionGuide,
                             cancellationToken: cancellationToken);
                     }
 

@@ -1,5 +1,12 @@
 # CODE_MAP.md
 
+- Issue #9 connection guide: `ConnectionGuideFlow` renders the shared Android/v2rayNG, iOS/V2Box and Windows/v2rayN
+  chooser for owned and tenant home menus, legacy installation entries and new-purchase delivery. The guide opens a
+  fresh Telegram message, preserves purchase input and uses the existing albums and `APPDL:` release callbacks.
+  Keep the guide available with downloads disabled. The live global switch controls the delivery caption and download
+  action. Owned v3 and legacy paid deliveries, tenant outbox and purchase resends attach the inline action to the
+  existing buyer message. Tenant renewals and owner notifications never use that markup.
+
 - Customer XUI v3 service presentation uses `XuiCustomerServiceText` in owned and tenant purchase and renewal menus.
   The three labels distinguish metered normal, fair-usage unlimited and national services without renaming catalog keys
   or changing role/store prices. Known renewal targets show «تمدید همین نوع سرویس». Owned ambiguous legacy renewals

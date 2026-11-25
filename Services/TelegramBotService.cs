@@ -7957,6 +7957,7 @@ public partial class TelegramBotService
     /// time also includes wallet, persistence, activity logging, and customer delivery performed before the audit.
     /// Paid legacy sales recheck global permission immediately before panel creation. Zero-price free-test behavior
     /// remains unchanged, and no control check interrupts an accepted creation's settlement.
+    /// Paid purchase delivery attaches the read-only connection guide to the existing QR message.
     /// </remarks>
     /// <example><code>await FinalizeCustomerAccount(client, state, currentProfile, confirmationMessage);</code></example>
     private async Task FinalizeCustomerAccount(ITelegramBotClient botClient, User user, CredUser credUser, Message message)
@@ -8025,8 +8026,12 @@ public partial class TelegramBotService
 
 
                 var msg = CaptionForAccountCreation(user, language: "fa", showTraffic: false);
-
-                await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200))), caption: msg, parseMode: ParseMode.Markdown);
+                var connectionGuide = user.ConfigPrice > 0
+                    ? ConnectionGuideFlow.BuildPurchaseMarkup(ConnectionGuideFlow.OwnedPrefix, _clientDownloadAvailability.Snapshot.Enabled)
+                    : null;
+                using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(user.ConfigLink, 200));
+                await botClient.SendPhoto(message.Chat.Id, InputFile.FromStream(qrStream), caption: msg,
+                    parseMode: ParseMode.Markdown, replyMarkup: connectionGuide);
                 // .GetAwaiter()
                 // .GetResult();
 
@@ -10328,28 +10333,27 @@ public partial class TelegramBotService
     /// <summary>
     /// Builds the Persian owned-bot main keyboard or a minimal tenant return action after shared payment inquiry.
     /// </summary>
-    /// <returns>A resized reply keyboard with five two-button owned-menu rows, or the single tenant /start return action.</returns>
+    /// <returns>A resized owned home keyboard with the connection guide, or the single tenant /start return action.</returns>
     /// <remarks>
     /// Owned regular customers and colleagues share the same two-column home layout, including the final menu action.
     /// The referral button is available only in owned routing. Tenant payment inquiry receives only /start,
     /// which reloads its fresh storefront menu and cannot expose owned wallet or referral navigation.
-    /// Owned customers reach miscellaneous tutorials through account management, then select an installation
-    /// platform there; neither educational entry appears on this home keyboard.
+    /// The connection guide opens the platform chooser directly. Miscellaneous tutorials remain accessible from
+    /// account management.
     /// </remarks>
     /// <example><code>var keyboard = MainReplyMarkupKeyboardFa();</code></example>
     ReplyKeyboardMarkup MainReplyMarkupKeyboardFa()
     {
         if (BotContextAccessor.CurrentBotType == BotInstanceTypes.Tenant)
             return new ReplyKeyboardMarkup(new[] { new KeyboardButton[] { "/start" } }) { ResizeKeyboard = true };
-        // Downloads, APN setup and miscellaneous tutorials live under account management; installation guidance is nested one level further.
-        // Availability is re-read when the account submenu is rendered. Tutorial assets are shared with tenant storefronts.
         var rows = new[]
         {
             new KeyboardButton[] { "💳خرید اکانت جدید", "💰شارژ حساب کاربری" },
             new KeyboardButton[] { "📋 تعرفه‌ها", "📒 تراکنش‌های من" },
             new KeyboardButton[] { "⚙️ مدیریت اکانت", OwnedRenewAction },
             new KeyboardButton[] { "🌟اکانت تست", "🎁 دعوت از دوستان" },
-            new KeyboardButton[] { "💻 ارتباط با ادمین", "🏠منو" }
+            new KeyboardButton[] { "💻 ارتباط با ادمین", "🏠منو" },
+            new KeyboardButton[] { ConnectionGuideFlow.MenuCommand }
         };
 
         ReplyKeyboardMarkup replyKeyboardMarkup = new(rows)

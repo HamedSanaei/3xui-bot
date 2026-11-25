@@ -88,8 +88,6 @@ public partial class TenantBotService
     private const string TENANTTUTORIALMANAGERDISABLEDMESSAGE =
         "این بخش فعلاً غیرفعال است و آموزش‌ها به‌صورت پیش‌فرض توسط سیستم ارائه می‌شوند.";
     /// <summary>Customer-facing menu text shown before the three built-in installation tutorials.</summary>
-    private const string TENANTTUTORIALMENUTEXT =
-        "📚 آموزش نصب\n\nسیستم‌عامل یا نرم‌افزار موردنظر خود را انتخاب کنید:";
     /// <summary>Customer-facing text used when the built-in tutorial images cannot be read from the deployed assets.</summary>
     private const string TENANTTUTORIALASSETSUNAVAILABLEMESSAGE =
         "در حال حاضر فایل‌های آموزش در دسترس نیستند. لطفاً کمی بعد دوباره تلاش کنید.";
@@ -940,7 +938,8 @@ public partial class TenantBotService
     /// <param name="User">Conversation state scoped to the active storefront and Telegram sender.</param>
     /// <param name="CancellationToken">Cancellation of Telegram, database, and fulfillment operations.</param>
     /// <returns>True if the active runtime is a tenant storefront.</returns>
-    /// <remarks>New order writes recheck tenant admission. Previously accepted provider and wallet payment recovery remains accessible.</remarks>
+    /// <remarks>New order writes recheck tenant admission. Previously accepted payment recovery remains accessible.
+    /// The connection guide is handled as storefront navigation even when a wallet amount is pending.</remarks>
     /// <exception cref="TenantCustomerBlockedException">A new order or unpaid wallet operation is denied during admission.</exception>
     private async Task<bool> HandleTenantUpdateCoreAsync(
         ITelegramBotClient botClient,
@@ -984,7 +983,8 @@ public partial class TenantBotService
              || walletCheck.StartsWith("settle_crypto_partial_", StringComparison.Ordinal)) && await _serviceProvider.GetRequiredService<TelegramBotService>()
             .TryHandleTenantWalletPaymentCheckAsync(update.CallbackQuery, CancellationToken))
             return true;
-        if (await TryHandleCustomerWalletAsync(botClient, update, CredUser, User, CancellationToken))
+        if (update.Message?.Text?.Trim() != ConnectionGuideFlow.MenuCommand &&
+            await TryHandleCustomerWalletAsync(botClient, update, CredUser, User, CancellationToken))
             return true;
         if (update.CallbackQuery is { } CallbackQuery)
         {
@@ -4116,6 +4116,7 @@ public partial class TenantBotService
     /// This method handles tenant-only purchase and payment messages locally, but delegates account-management
     /// commands and the unchanged bot/user-scoped free-trial policy to <see cref="XuiV3BotFlowService" />.
     /// Contacts use the owned-bot verifier and save only the shared phone profile, without financial effects.
+    /// The home connection guide opens after the membership check without consuming the customer's active input step.
     /// The outer dispatcher clears persisted conversation state and the
     /// in-memory XUI selection before every valid tenant <c>/start</c>, then this method preserves the storefront-enabled
     /// and mandatory-join gates before displaying home. Payment success/cancel payloads retain their existing order
@@ -4142,6 +4143,12 @@ public partial class TenantBotService
 
         if (!await EnsureTenantCustomerJoinAsync(botClient, Message, tenant, CancellationToken))
             return;
+
+        if (Message.Text?.Trim() == ConnectionGuideFlow.MenuCommand)
+        {
+            await SendTenantTutorialsAsync(botClient, Message.Chat.Id, CancellationToken);
+            return;
+        }
 
         // A card-to-card receipt may arrive either as a compressed Telegram photo or as an uncompressed image
         // document, which is what the production incident exposed. Both resolve to a plain file id through one helper so
@@ -4260,7 +4267,7 @@ public partial class TenantBotService
         if (IsTenantTutorialCommand(Text))
         {
             await _state.ClearUserStatus(new User { Id = Message.From.Id });
-            await SendTenantTutorialsAsync(botClient, Message.Chat.Id, tenant, CancellationToken);
+            await SendTenantTutorialsAsync(botClient, Message.Chat.Id, CancellationToken);
             return;
         }
 
@@ -6259,9 +6266,8 @@ public partial class TenantBotService
     /// </summary>
     /// <param name="botClient">Tenant bot client used to send the tutorial menu.</param>
     /// <param name="chatId">Telegram chat id of the tenant customer requesting help.</param>
-    /// <param name="tenant">Tenant bot that owns this storefront conversation; used only for tenant context.</param>
     /// <param name="cancellationToken">Cancellation token for the Telegram send operation.</param>
-    /// <returns>A task completing after the category menu has been sent.</returns>
+    /// <returns>A task completing after the shared connection guide has sent the three platform choices.</returns>
     /// <remarks>
     /// Tutorials are built into the application and are identical for every storefront. This method therefore never
     /// reads <c>TenantTutorialsJson</c> and performs no users.db write: choosing a tutorial is a pure presentation action
@@ -6270,26 +6276,11 @@ public partial class TenantBotService
     /// The customer is never left in a tutorial conversation step, so the normal tenant reply keyboard keeps working after
     /// the guide is delivered.
     /// </remarks>
-    private async Task SendTenantTutorialsAsync(
+    private Task SendTenantTutorialsAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
-        BotInstance tenant,
-        CancellationToken cancellationToken)
-    {
-        // One row per category so the operating system is unambiguous on narrow mobile clients.
-        var rows = new List<InlineKeyboardButton[]>
-        {
-            new[] { InlineKeyboardButton.WithCallbackData("🤖 آموزش نصب Android", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Android) },
-            new[] { InlineKeyboardButton.WithCallbackData("🍎 آموزش نصب iOS", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Ios) },
-            new[] { InlineKeyboardButton.WithCallbackData("🪟 آموزش نصب ویندوز", CUSTOMERCALLBACKPREFIX + "tutorial:" + TenantTutorialKinds.Windows) }
-        };
-
-        await botClient.SendMessage(
-            chatId,
-            TENANTTUTORIALMENUTEXT,
-            replyMarkup: new InlineKeyboardMarkup(rows),
-            cancellationToken: cancellationToken);
-    }
+        CancellationToken cancellationToken) =>
+        ConnectionGuideFlow.SendPlatformMenuAsync(botClient, chatId, ConnectionGuideFlow.TenantPrefix, cancellationToken);
 
     /// <summary>
     /// Delivers one built-in installation tutorial to a tenant customer as Telegram photo albums.
@@ -6433,6 +6424,7 @@ public partial class TenantBotService
     /// conversation to the earliest valid menu. Stale callback data never creates an order or payment invoice.
     /// Stale service, traffic, duration and unlimited-plan callbacks re-read global sale permission before state advances.
     /// Provider/order activation repeats this check at its final boundary; payment inquiry and settlement remain independent.
+    /// Connection guide navigation reuses the tenant access gates and leaves the purchase message and current input step intact.
     /// </remarks>
     /// <returns>A task that completes after the callback is rejected, recovered, or routed to its tenant operation.</returns>
     /// <exception cref="OperationCanceledException">
@@ -6481,6 +6473,15 @@ public partial class TenantBotService
         if (!await EnsureTenantCustomerJoinAsync(botClient, ChatId, CallbackQuery.From.Id, tenant, CancellationToken))
         {
             await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, "ابتدا در کانال عضو شوید.", showAlert: true, cancellationToken: CancellationToken);
+            return;
+        }
+
+        if (CallbackQuery.Data.StartsWith(ConnectionGuideFlow.TenantPrefix, StringComparison.Ordinal))
+        {
+            await SafeAnswerCallbackQueryAsync(botClient, CallbackQuery.Id, cancellationToken: CancellationToken);
+            await ConnectionGuideFlow.SendActionAsync(botClient, ChatId, ConnectionGuideFlow.TenantPrefix,
+                CallbackQuery.Data[ConnectionGuideFlow.TenantPrefix.Length..], _clientDownloadAvailability.Snapshot.Enabled,
+                _logger, CancellationToken);
             return;
         }
 
@@ -6917,7 +6918,7 @@ public partial class TenantBotService
 
     /// <summary>Builds the tenant home keyboard with customer-wallet navigation only for a freshly approved store.</summary>
     /// <param name="store">Fresh storefront snapshot; null never displays wallet actions.</param>
-    /// <returns>A reply keyboard whose actions remain subject to fresh callback/message authorization.</returns>
+    /// <returns>A reply keyboard with the connection guide and actions subject to fresh callback/message authorization.</returns>
     private ReplyKeyboardMarkup BuildTenantReplyKeyboardForStore(BotInstance store)
     {
         // The latest-client-download button is global and read from the live switch on every render, so a super-admin
@@ -6927,7 +6928,7 @@ public partial class TenantBotService
         {
             new KeyboardButton[] { "💳 خرید اکانت", "📋 تعرفه‌ها" },
             new KeyboardButton[] { "اکانت‌های من", "🔄 تمدید اکانت" },
-            new KeyboardButton[] { "جستجوی اکانت", "راهنما نصب" },
+            new KeyboardButton[] { "جستجوی اکانت", ConnectionGuideFlow.MenuCommand },
             new KeyboardButton[] { "🌟اکانت تست", "💬 پشتیبانی" }
         };
 
@@ -12498,6 +12499,7 @@ public partial class TenantBotService
     /// <remarks>
     /// Delivery is best-effort and intentionally does not throw back into fulfillment. A Telegram delivery
     /// failure after XUI creation and ledger writes must not mark the already-created order as failed.
+    /// The buyer's persisted order kind determines whether the delivery includes a connection guide.
     /// </remarks>
     private async Task NOTIFYTENANTCUSTOMERSUCCESSASYNC(TenantBotOrder order, XuiV3AccountCreationResult created, CancellationToken CancellationToken)
     {
@@ -12505,7 +12507,7 @@ public partial class TenantBotService
         {
             await SENDCREATEDACCOUNTDETAILSASYNC(
                 _botClientProvider.GetClient(order.TenantBotId),
-                GetTenantCustomerDeliveryChatId(order),
+                order,
                 created,
                 CancellationToken);
         }
@@ -12526,6 +12528,7 @@ public partial class TenantBotService
     /// <remarks>
     /// This method never changes wallet, ledger, payment, or XUI state. It only replays stored fulfillment data
     /// and is therefore safe to call after duplicate manual approvals or duplicate Sales Assistant callbacks.
+    /// The guide is rendered with the live global switch only for a purchase sent to the buyer.
     /// </remarks>
     private async Task<bool> SENDTENANTORDERACCOUNTDETAILSASYNC(
         TenantBotOrder order,
@@ -12541,7 +12544,7 @@ public partial class TenantBotService
         {
             try
             {
-                await SENDCREATEDACCOUNTDETAILSASYNC(tenantClient, GetTenantCustomerDeliveryChatId(order), created, CancellationToken);
+                await SENDCREATEDACCOUNTDETAILSASYNC(tenantClient, order, created, CancellationToken);
             }
             catch (Exception ex)
             {
@@ -12619,22 +12622,26 @@ public partial class TenantBotService
     }
 
     /// <summary>
-    /// Sends one created account result as text or QR photo to a Telegram chat.
+    /// Sends a tenant buyer's stored account result as text or a QR photo.
     /// </summary>
     /// <param name="botClient">Telegram bot client that should send the account details.</param>
-    /// <param name="chatId">Target Telegram chat id for the buyer or tenant owner.</param>
+    /// <param name="order">Fulfilled order from the bot that owns the delivery, including the buyer's Telegram destination and order kind.</param>
     /// <param name="created">Stored account creation result.</param>
     /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
+    /// <returns>A task that completes after the buyer's account message is sent.</returns>
     /// <remarks>
-    /// When a subscription link exists, the QR is regenerated locally from the stored link. No panel call is made.
+    /// The QR is regenerated locally from the stored link when present. Only purchase orders include the guide.
+    /// Delivery does not contact the panel or release provider and does not update the order.
     /// </remarks>
     private async Task SENDCREATEDACCOUNTDETAILSASYNC(
         ITelegramBotClient botClient,
-        ChatId chatId,
+        TenantBotOrder order,
         XuiV3AccountCreationResult created,
         CancellationToken CancellationToken)
     {
+        var chatId = GetTenantCustomerDeliveryChatId(order);
         var Text = _purchaseService.BuildCreatedAccountText(created);
+        var connectionGuide = ConnectionGuideFlow.BuildTenantPurchaseMarkup(order, _clientDownloadAvailability.Snapshot.Enabled);
         if (!string.IsNullOrWhiteSpace(created.SubLink))
         {
             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(created.SubLink, 200));
@@ -12643,11 +12650,13 @@ public partial class TenantBotService
                 photo: InputFile.FromStream(qrStream, "subscription-qr.png"),
                 caption: Text,
                 parseMode: ParseMode.Html,
+                replyMarkup: connectionGuide,
                 cancellationToken: CancellationToken);
             return;
         }
 
-        await botClient.SendMessage(chatId, Text, parseMode: ParseMode.Html, cancellationToken: CancellationToken);
+        await botClient.SendMessage(chatId, Text, parseMode: ParseMode.Html, replyMarkup: connectionGuide,
+            cancellationToken: CancellationToken);
     }
 
     /// <summary>

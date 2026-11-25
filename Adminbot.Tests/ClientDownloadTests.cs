@@ -717,18 +717,20 @@ public sealed partial class ConcurrencyTests
         var service = BuildClientDownloadTelegramService(databases, flag, new CountingReleaseService(), client);
 
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
+        Assert.Contains(ConnectionGuideFlow.MenuCommand, OwnedKeyboardLabels(service));
         Assert.DoesNotContain(AppleMobileConfigText.MenuCommand, OwnedKeyboardLabels(service));
         Assert.Contains(AppleMobileConfigText.MenuCommand, OwnedAccountManagementLabels(service, new CredUser()));
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedAccountManagementLabels(service, new CredUser()));
 
         flag.SetEnabled(true);
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, OwnedKeyboardLabels(service));
+        Assert.Contains(ConnectionGuideFlow.MenuCommand, OwnedKeyboardLabels(service));
         Assert.Contains(ClientDownloadCallbacks.OpenCommand, OwnedAccountManagementLabels(service, new CredUser()));
         Assert.Contains(AppleMobileConfigText.MenuCommand, OwnedAccountManagementLabels(service, new CredUser()));
     }
 
-    /// <summary>All owned home actions occupy paired rows, including the trial and return-to-menu actions.</summary>
-    /// <remarks>Regression: independently appended trial and home buttons left two full-width rows despite an even action count.</remarks>
+    /// <summary>The owned home keeps paired rows and puts the new connection guide on the final row.</summary>
+    /// <remarks>The trial and home buttons stay in their existing pairs. The connection guide is the only unpaired action.</remarks>
     [Fact]
     public void Owned_customer_keyboard_packs_all_actions_in_two_columns()
     {
@@ -740,8 +742,9 @@ public sealed partial class ConcurrencyTests
             new GatewayTelegramClient());
 
         var rows = OwnedKeyboardRows(service);
-        Assert.Equal(5, rows.Count);
-        Assert.All(rows, row => Assert.Equal(2, row.Length));
+        Assert.Equal(6, rows.Count);
+        Assert.All(rows.Take(5), row => Assert.Equal(2, row.Length));
+        Assert.Equal(ConnectionGuideFlow.MenuCommand, Assert.Single(rows[^1]));
     }
 
     /// <summary>Account-management rows remain paired after role-specific and optional actions are selected.</summary>
@@ -820,10 +823,12 @@ public sealed partial class ConcurrencyTests
         var service = BuildClientDownloadTenantService(databases, flag, new CountingReleaseService());
 
         Assert.DoesNotContain(ClientDownloadCallbacks.OpenCommand, TenantKeyboardLabels(service));
+        Assert.Contains(ConnectionGuideFlow.MenuCommand, TenantKeyboardLabels(service));
         Assert.Contains(AppleMobileConfigText.MenuCommand, TenantKeyboardLabels(service));
 
         flag.SetEnabled(true);
         Assert.Contains(ClientDownloadCallbacks.OpenCommand, TenantKeyboardLabels(service));
+        Assert.Contains(ConnectionGuideFlow.MenuCommand, TenantKeyboardLabels(service));
         Assert.Contains(AppleMobileConfigText.MenuCommand, TenantKeyboardLabels(service));
     }
 

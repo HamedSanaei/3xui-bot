@@ -13,9 +13,8 @@ using Telegram.Bot.Types;
 /// switch, so an administrator toggle applies to the next render and to every already-sent button.
 /// </para>
 /// <para>
-/// This surface is deliberately separate from the built-in installation tutorial albums. Tutorial callbacks stay in the
-/// <c>TN:</c> namespace and download callbacks in <c>APPDL:</c>, so the two features cannot collide or route into each
-/// other.
+    /// The connection guide and standalone download menu both use the <c>APPDL:</c> download callbacks.
+    /// Album navigation uses the existing <c>TN:</c> customer namespace.
 /// </para>
 /// </remarks>
 public partial class TenantBotService
@@ -66,9 +65,8 @@ public partial class TenantBotService
     /// <param name="cancellationToken">Cancellation token for Telegram and provider work.</param>
     /// <returns>A task that completes after the link or a friendly notice has been sent.</returns>
     /// <remarks>
-    /// The callback is acknowledged first so the customer's client does not spin while GitHub is queried, then the live
-    /// global switch is re-checked so a stale inline button fails closed without contacting GitHub. Only the shared
-    /// release resolver is used, so a tenant customer receives exactly the same asset a customer of the main bot does; the
+    /// The live switch is checked before and after acknowledgement, so a stale inline button cannot start a lookup.
+    /// The shared release resolver gives a tenant customer the same asset as the main bot. The
     /// callback cannot select another tenant, another repository, or an arbitrary URL.
     /// </remarks>
     private async Task HandleClientDownloadPlatformCallbackAsync(
@@ -90,6 +88,7 @@ public partial class TenantBotService
         }
 
         await SafeAnswerCallbackQueryAsync(botClient, callbackQuery.Id, cancellationToken: cancellationToken);
+        if (!_clientDownloadAvailability.Snapshot.Enabled) return;
         await ClientDownloadFlow.SendPlatformResultAsync(
             botClient,
             chatId,

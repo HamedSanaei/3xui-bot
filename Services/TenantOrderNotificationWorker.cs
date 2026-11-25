@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using Adminbot.Domain;
+using Adminbot.Services;
 using Microsoft.Extensions.Configuration;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
@@ -41,7 +42,18 @@ public sealed class TenantOrderNotificationDeliveryService
     private readonly SalesAssistantService _salesAssistantService;
     private readonly TenantOwnerNotificationTransportResolver _ownerTransportResolver;
     private readonly UserDbContextFactory _userDbContextFactory;
+    /// <summary>Live global download switch used to label the guide at the time of outbox delivery.</summary>
+    private readonly IClientDownloadAvailability _clientDownloadAvailability;
 
+    /// <summary>Creates a sender for committed tenant order notifications.</summary>
+    /// <param name="botRegistry">Active bot descriptors used to verify available Telegram destinations.</param>
+    /// <param name="botClientProvider">Resolves Telegram transport for the exact bot that owns each delivery.</param>
+    /// <param name="credentialsStore">Global profile store used for owner and buyer display details.</param>
+    /// <param name="purchaseService">Formats stored account details without reopening an order.</param>
+    /// <param name="salesAssistantService">Delivers operational notifications through the configured sales assistant.</param>
+    /// <param name="ownerTransportResolver">Selects the approved transport for the order owner's notifications.</param>
+    /// <param name="userDbContextFactory">Factory for scoped reads of persisted order and recovery data.</param>
+    /// <param name="clientDownloadAvailability">Optional live global download switch. Null leaves the connection guide available without downloads.</param>
     public TenantOrderNotificationDeliveryService(
         BotRegistry botRegistry,
         BotClientProvider botClientProvider,
@@ -49,7 +61,8 @@ public sealed class TenantOrderNotificationDeliveryService
         XuiV3PurchaseService purchaseService,
         SalesAssistantService salesAssistantService,
         TenantOwnerNotificationTransportResolver ownerTransportResolver,
-        UserDbContextFactory userDbContextFactory)
+        UserDbContextFactory userDbContextFactory,
+        IClientDownloadAvailability clientDownloadAvailability = null)
     {
         _botRegistry = botRegistry;
         _botClientProvider = botClientProvider;
@@ -58,6 +71,7 @@ public sealed class TenantOrderNotificationDeliveryService
         _salesAssistantService = salesAssistantService;
         _ownerTransportResolver = ownerTransportResolver;
         _userDbContextFactory = userDbContextFactory;
+        _clientDownloadAvailability = clientDownloadAvailability;
     }
 
     public Task<int?> SendAsync(TenantBotOrder order, string kind, CancellationToken cancellationToken) => kind switch
@@ -71,6 +85,13 @@ public sealed class TenantOrderNotificationDeliveryService
             SendTenantCardReceiptReuploadRecoveryAsync(order, cancellationToken),
         _ => throw new TenantOrderNotificationPermanentException("unknown_notification_kind")
     };
+    /// <summary>Sends the stored account to the buyer after a tenant order has fulfilled.</summary>
+    /// <param name="order">Fulfilled order with the exact tenant bot, buyer's Telegram destination and serialized account snapshot.</param>
+    /// <param name="cancellationToken">Cancellation of Telegram delivery. The worker manages notification retries.</param>
+    /// <returns>The delivered Telegram message id, or null if the order's own bot is unavailable.</returns>
+    /// <remarks>New purchases include a guide on the QR or text message. Renewals use their own success text.
+    /// No release, payment or panel call occurs, and existing outbox retry and deduplication behavior applies.</remarks>
+    /// <exception cref="TenantOrderNotificationPermanentException">The order has no stored account details to deliver.</exception>
     private async Task<int?> SendCustomerAccountAsync(TenantBotOrder order, CancellationToken cancellationToken)
     {
         var bot = _botRegistry.GetById(order.TenantBotId);
@@ -93,15 +114,17 @@ public sealed class TenantOrderNotificationDeliveryService
         }
 
         var text = _purchaseService.BuildCreatedAccountText(created);
+        var connectionGuide = ConnectionGuideFlow.BuildTenantPurchaseMarkup(order,
+            _clientDownloadAvailability?.Snapshot.Enabled == true);
         if (!string.IsNullOrWhiteSpace(created.SubLink))
         {
             using var qrStream = new MemoryStream(QrCodeGen.GenerateQRCodeWithMargin(created.SubLink, 200));
             var sent = await client.SendPhoto(chatId, InputFile.FromStream(qrStream, "subscription-qr.png"),
-                caption: text, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+                caption: text, parseMode: ParseMode.Html, replyMarkup: connectionGuide, cancellationToken: cancellationToken);
             return sent.MessageId;
         }
 
-        return (await client.SendMessage(chatId, text, parseMode: ParseMode.Html,
+        return (await client.SendMessage(chatId, text, parseMode: ParseMode.Html, replyMarkup: connectionGuide,
             cancellationToken: cancellationToken)).MessageId;
     }
     /// <summary>Delivers a fulfilled sale summary through the owner's selected management bot.</summary>
