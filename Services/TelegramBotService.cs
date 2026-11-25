@@ -142,6 +142,7 @@ public partial class TelegramBotService
         TenantBotService.TenantWalletAdminMenuAction,
         AdminClientDownloadAction,
         AdminTrialAccountLoggingAction,
+        AdminPhoneVerificationAction,
         TelegramEndpointAdminService.Action,
         "🤖 وضعیت ربات‌ها",
         AdminManualReviewAction,
@@ -241,6 +242,8 @@ public partial class TelegramBotService
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
     /// <summary>Shared persisted preference for Telegram-only trial acquisition audits across all bots.</summary>
     private readonly TrialAccountLoggingSettings _trialAccountLogging;
+    /// <summary>Live owned-customer phone requirement shared with the XUI flow and the super-admin panel.</summary>
+    private readonly PhoneVerificationSettings _phoneVerification;
     /// <summary>Optional identity-bound global endpoint control plane; tenant/customer flows never gain endpoint authority.</summary>
     private readonly TelegramEndpointAdminService _endpointAdmin;
     private readonly IClientReleaseService _clientReleaseService;
@@ -388,6 +391,7 @@ public partial class TelegramBotService
     /// </param>
     /// <param name="publicChannelPosts">Required singleton public-channel draft/job manager; private-customer broadcasts remain separate.</param>
     /// <param name="trialAccountLogging">Required singleton global trial-channel preference; never changes trial eligibility or issuance.</param>
+    /// <param name="phoneVerification">Host singleton for the owned-customer phone requirement. Standalone callers may omit it to use startup configuration.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used:
     /// two seconds for callback acknowledgement and one overall five-second budget for mandatory-join
@@ -454,7 +458,8 @@ public partial class TelegramBotService
         ITelegramMandatoryJoinMembershipCache mandatoryJoinMembershipCache = null,
         AppleMobileConfigTelegramFlow appleMobileConfigFlow = null,
         TelegramEndpointAdminService endpointAdmin = null,
-        TenantCardProvisionalManualReviewAdminService provisionalManualReview = null)
+        TenantCardProvisionalManualReviewAdminService provisionalManualReview = null,
+        PhoneVerificationSettings phoneVerification = null)
     {
         _botClient = botClient;
         _workflow = dbContext;
@@ -502,6 +507,8 @@ public partial class TelegramBotService
         _referralService = referralService;
         _publicChannelPosts = publicChannelPosts ?? throw new ArgumentNullException(nameof(publicChannelPosts));
         _trialAccountLogging = trialAccountLogging ?? throw new ArgumentNullException(nameof(trialAccountLogging));
+        _phoneVerification = phoneVerification ?? new PhoneVerificationSettings(_appConfig ?? new AppConfig(),
+            Path.Combine(AppContext.BaseDirectory, "Data", "configuration.json"));
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
         _mandatoryJoinMembershipCache = mandatoryJoinMembershipCache ?? new TelegramMandatoryJoinMembershipCache();
     }
@@ -932,6 +939,8 @@ public partial class TelegramBotService
     /// on every callback; second confirmations enter the existing tenant order gate, never the renewal settlement path.
     /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
     /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
+    /// Owned phone settings are routed before customer state. Super-admin access and recognized payment-return commands
+    /// remain independent of the customer entry prompt, and tenant and assistant routing retain their own rules.
     /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
     /// Tenant isolation, before legacy state/non-text dispatch. Administrative navigation abandons unpublished
     /// composition only; admitted jobs keep their immutable content and destinations.
@@ -1003,6 +1012,8 @@ public partial class TelegramBotService
             if (await TryHandleSalesControlCallbackAsync(botClient, callbackQuery, cancellationToken))
                 return;
             if (await TryHandleTrialAccountLoggingCallbackAsync(botClient, callbackQuery, cancellationToken))
+                return;
+            if (await TryHandlePhoneVerificationSettingsCallbackAsync(botClient, callbackQuery, cancellationToken))
                 return;
 
 
@@ -1197,6 +1208,8 @@ public partial class TelegramBotService
         if (isOwnedBot && await TryHandleSalesControlMessageAsync(botClient, message, isOwnedBot, cancellationToken))
             return;
         if (isOwnedBot && await TryHandleTrialAccountLoggingMessageAsync(botClient, message, isOwnedBot, cancellationToken))
+            return;
+        if (isOwnedBot && await TryHandlePhoneVerificationSettingsMessageAsync(botClient, message, cancellationToken))
             return;
 
 
@@ -6127,8 +6140,10 @@ public partial class TelegramBotService
     /// <remarks>
     /// Tenant storefront updates are removed by the outer dispatcher before this method runs. Valid <c>/start</c> and
     /// <c>/refresh</c> commands have already cleared the current bot/user persisted state and XUI purchase session, but
-    /// this method still enforces mandatory-channel membership before displaying the owned main menu. Start referral
-    /// payloads are registered after the reset and retain their existing immutable relationship rules. Legacy
+    /// this method still enforces mandatory-channel membership and the live phone requirement before displaying the owned
+    /// entry menu. An accepted Telegram contact updates the shared profile across bots, and disabling the requirement
+    /// never changes that profile. Start referral payloads are registered before the prompt. Legacy trial confirmation
+    /// rechecks current phone admission for normal customers without changing cooldown or account settlement. Legacy
     /// insufficient-wallet branches show an inline shortcut into the canonical main-keyboard charge flow.
     /// Trial entry displays «اکانت تست» while accepting the previous free-account button as an input alias.
     /// Active colleagues share the configured Tehran-day free-test quota across owned bots and can explicitly buy
@@ -6152,32 +6167,11 @@ public partial class TelegramBotService
         var chatId = message.Chat.Id;
 
 
-        if (message is not null && message.Type == MessageType.Contact && message.Contact != null)
-        {
-            await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
-            var normalizedPhoneNumber = await ValidateOwnedBotPhoneContactAsync(
-                botClient,
-                message,
-                cancellationToken);
-            if (!string.IsNullOrWhiteSpace(normalizedPhoneNumber))
-            {
-                await _credentialsDbContext.SavePhoneNumber(message.From.Id, normalizedPhoneNumber);
-                await botClient.CustomSendTextMessageAsync(
-                             chatId: message.Chat.Id,
-                             text: "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
-                             replyMarkup: MainReplyMarkupKeyboardFa());
-                return;
-            }
-            else
-            {
-
-            }
-        }
-        // Only process text messages
-        if (message.Text is not { } messageText)
+        if (message.Text == null && message.Contact == null)
             return;
 
-        Console.WriteLine($"Received a '{message.Text}' message in chat {chatId}.");
+        if (message.Text != null)
+            Console.WriteLine($"Received a '{message.Text}' message in chat {chatId}.");
 
 
         var credUser = await _credentialsDbContext.GetUserStatus(GetCreduserFromMessage(message));
@@ -6247,6 +6241,40 @@ public partial class TelegramBotService
                 chatId: message.Chat.Id,
                 text: "پس از عضویت روی دکمه زیر کلیک کنید.",
                 replyMarkup: replyKeyboardMarkup);
+            return;
+        }
+
+        if (message.Contact != null)
+        {
+            // Keep the contact keyboard after a rejected entry contact. A valid contact updates the shared profile.
+            var normalizedPhoneNumber = await ValidateOwnedBotPhoneContactAsync(
+                botClient, message, NeedsOwnedPhoneVerification(credUser), cancellationToken);
+            if (!string.IsNullOrWhiteSpace(normalizedPhoneNumber))
+            {
+                await _credentialsDbContext.SavePhoneNumber(message.From.Id, normalizedPhoneNumber);
+                await botClient.CustomSendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "شماره شما با موفقیت تایید شد. حالا دوباره گزینه مورد نظرتان را انتخاب کنید.",
+                    replyMarkup: MainReplyMarkupKeyboardFa());
+            }
+            return;
+        }
+
+        // Stale menu buttons and the join confirmation must use the same admission rule as /start.
+        var isEntryMenuAction = message.Text is "عضو شدم!" or "🏠منو" or "لغو" or "منوی اصلی";
+        if ((hasNavigationCommand || isEntryMenuAction) &&
+            NeedsOwnedPhoneVerification(credUser))
+        {
+            if (isEntryMenuAction)
+                await _state.ClearUserStatus(new User { Id = message.From.Id });
+            if (message.Text == "لغو")
+            {
+                await botClient.SendMessage(message.Chat.Id, "فرایند لغو شد. برای ورود دوباره /start را ارسال کنید.",
+                    replyMarkup: new ReplyKeyboardRemove(), cancellationToken: cancellationToken);
+                return;
+            }
+            await SendOwnedPhoneEntryPromptAsync(botClient, message.Chat.Id, cancellationToken,
+                BuildReferralRegistrationMessage(referralRegistration));
             return;
         }
 
@@ -6543,16 +6571,9 @@ public partial class TelegramBotService
             // Normal user
             else
             {
-                if (string.IsNullOrEmpty(credUser.PhoneNumber))
+                if (NeedsOwnedPhoneVerification(credUser))
                 {
-                    string text =
-                        "برای تأیید خودکار، فقط شماره موبایل ایران پذیرفته می‌شود و شماره ارسالی باید متعلق به همین حساب تلگرام باشد.\n\n" +
-                        "لطفاً شماره خود را با دکمه زیر ارسال کنید و سپس دوباره روی دریافت اکانت تست بزنید. " +
-                        "برای انصراف می‌توانید /start را ارسال کنید.";
-                    await botClient.CustomSendTextMessageAsync(
-                                chatId: message.Chat.Id,
-                                text: text,
-                                replyMarkup: GetPhoneNumber());
+                    await SendLegacyTrialPhonePromptAsync(botClient, message.Chat.Id, cancellationToken);
                     return;
                 }
                 else if ((DateTime.Now - user.LastFreeAcc).Days <= 30)
@@ -7647,6 +7668,13 @@ public partial class TelegramBotService
         }
         else if (user.Flow == "create" && user.LastStep == "ask_confirmation" && (message.Text == "تایید نهایی" || message.Text == "انصراف"))
         {
+            // An unpaid legacy trial begun while verification was disabled may still have its final button visible.
+            if (message.Text == "تایید نهایی" && user.SelectedCountry == "Test" && !credUser.IsColleague &&
+                NeedsOwnedPhoneVerification(credUser))
+            {
+                await SendLegacyTrialPhonePromptAsync(botClient, message.Chat.Id, cancellationToken);
+                return;
+            }
             await FinalizeCustomerAccount(ActiveBotClient, user, credUser, message);
         }
 
@@ -10979,6 +11007,7 @@ public partial class TelegramBotService
     /// <param name="message">
     /// Incoming private Telegram message containing a contact. Its sender id and contact user id must match.
     /// </param>
+    /// <param name="keepVerificationKeyboard">True when the owned customer still needs verification and a rejection should keep the contact keyboard.</param>
     /// <param name="cancellationToken">Polling cancellation token used for Telegram feedback.</param>
     /// <returns>
     /// The canonical <c>+989xxxxxxxxx</c> phone number when the contact belongs to the sender and is Iranian;
@@ -10987,11 +11016,12 @@ public partial class TelegramBotService
     /// <remarks>
     /// This owned-bot wrapper delegates to the verifier also used by tenant handlers with their own menus and support.
     /// Foreign or virtual numbers may still be approved through the separate super-admin manual flow. When an
-    /// own foreign contact is rejected, support comes strictly from the current owned bot configuration.
+    /// own foreign contact is rejected, support comes strictly from the current owned bot configuration. If the
+    /// phone requirement is active for this customer, rejection keeps the contact keyboard available for a retry.
     /// </remarks>
     /// <example>
     /// <code>
-    /// var phone = await ValidateOwnedBotPhoneContactAsync(client, message, cancellationToken);
+    /// var phone = await ValidateOwnedBotPhoneContactAsync(client, message, needsVerification, cancellationToken);
     /// if (phone != null)
     ///     await credentials.SavePhoneNumber(message.From.Id, phone);
     /// </code>
@@ -10999,10 +11029,12 @@ public partial class TelegramBotService
     private async Task<string> ValidateOwnedBotPhoneContactAsync(
         ITelegramBotClient botClient,
         Message message,
+        bool keepVerificationKeyboard,
         CancellationToken cancellationToken)
     {
         return await TelegramPhoneVerification.ValidateAsync(botClient, message,
-            BuildOwnedBotSupportContactHtml(CurrentSupportAccount), MainReplyMarkupKeyboardFa(), cancellationToken);
+            BuildOwnedBotSupportContactHtml(CurrentSupportAccount),
+            keepVerificationKeyboard ? GetPhoneNumber() : MainReplyMarkupKeyboardFa(), cancellationToken);
     }
 
 

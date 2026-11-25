@@ -109,6 +109,8 @@ public partial class XuiV3BotFlowService
     /// without waiting the real production timeout.
     /// </summary>
     private readonly TelegramInteractionTimeouts _interactionTimeouts;
+    /// <summary>Live owned-bot phone preference. Existing tenant checks remain mandatory.</summary>
+    private readonly PhoneVerificationSettings _phoneVerification;
 
     /// <summary>
     /// Creates the shared XUI v3 customer-flow service used by owned bots and tenant storefront bots.
@@ -158,6 +160,7 @@ public partial class XuiV3BotFlowService
     /// <param name="colleagueTrialQuotaStore">Required durable global-per-colleague Tehran-day quota and paid-test receipt store.</param>
     /// <param name="trialCreationOperations">Required shared panel creation evidence store; preserves funded paid-test recovery and started owned-batch settlement across later global sales closure.</param>
     /// <param name="appConfig">Required singleton startup options supplying the nonnegative colleague daily free-test count; not rebound per Telegram execution.</param>
+    /// <param name="phoneVerification">Optional live phone policy for owned sales bots. Without it, existing phone checks require a verified number.</param>
     /// <param name="interactionTimeouts">
     /// Optional immutable budgets for UX-only Telegram interactions. When null the production budgets are used, so
     /// callback acknowledgement is bounded at two seconds. Tests pass millisecond values. This value is never read
@@ -185,7 +188,8 @@ public partial class XuiV3BotFlowService
         ColleagueTrialQuotaStore colleagueTrialQuotaStore,
         XuiV3CreationOperationStore trialCreationOperations,
         AppConfig appConfig,
-        TelegramInteractionTimeouts interactionTimeouts = null)
+        TelegramInteractionTimeouts interactionTimeouts = null,
+        PhoneVerificationSettings phoneVerification = null)
     {
         _purchaseService = purchaseService;
         _sessionStore = sessionStore;
@@ -205,6 +209,7 @@ public partial class XuiV3BotFlowService
         _trialCreationOperations = trialCreationOperations;
         _colleagueDailyFreeTrialLimit = appConfig.ColleagueDailyFreeTrialLimit;
         _interactionTimeouts = interactionTimeouts ?? TelegramInteractionTimeouts.Production;
+        _phoneVerification = phoneVerification;
     }
 
     public bool IsEnabledForPurchaseFlow()
@@ -10143,10 +10148,10 @@ public partial class XuiV3BotFlowService
     }
 
     /// <summary>
-    /// Ensures an owned-bot customer has a previously verified phone number before starting a purchase or renewal.
+    /// Applies the active bot's phone requirement before an existing phone-gated account action.
     /// </summary>
     /// <param name="botClient">
-    /// Telegram client for the active owned bot. Tenant storefront updates do not enter this flow.
+    /// Telegram client for the active owned bot or tenant storefront that received the update.
     /// </param>
     /// <param name="chatId">Private Telegram chat id that receives the contact-request keyboard.</param>
     /// <param name="credUser">
@@ -10155,14 +10160,16 @@ public partial class XuiV3BotFlowService
     /// </param>
     /// <param name="cancellationToken">Polling cancellation token used for the Telegram request.</param>
     /// <returns>
-    /// <c>true</c> when a verified phone is already stored; otherwise <c>false</c> after sending the Iranian-number
-    /// requirement and contact keyboard.
+    /// <c>true</c> when the owned requirement is disabled or the shared profile already has a verified number;
+    /// otherwise <c>false</c> after sending the Iranian-number requirement and contact keyboard.
     /// </returns>
     /// <remarks>
-    /// Automatic verification accepts only the sender's own Iranian mobile contact. Foreign and virtual numbers are
-    /// rejected by the common owned-bot contact handler and redirected to the active bot's configured support account.
-    /// A super-admin may still verify those numbers through the separate audited manual flow.
+    /// The async-local bot type keeps the owned exception out of tenant checks, even for the same Telegram account.
+    /// Automatic contact verification still requires the sender's own Iranian mobile number. A super-admin can use
+    /// the separate audited manual flow. This method never writes user profiles, invoices, wallet balances, or trial quota.
     /// </remarks>
+    /// <exception cref="OperationCanceledException">The contact prompt is cancelled.</exception>
+    /// <exception cref="Telegram.Bot.Exceptions.ApiRequestException">Telegram rejects delivery of the contact prompt.</exception>
     /// <example>
     /// <code>
     /// if (!await EnsurePhoneVerifiedAsync(client, message.Chat.Id, credUser, cancellationToken))
@@ -10175,7 +10182,8 @@ public partial class XuiV3BotFlowService
         CredUser credUser,
         CancellationToken cancellationToken)
     {
-        if (!string.IsNullOrWhiteSpace(credUser?.PhoneNumber))
+        if (_phoneVerification?.IsRequiredFor(BotContextAccessor.CurrentBotType) == false ||
+            !string.IsNullOrWhiteSpace(credUser?.PhoneNumber))
             return true;
 
         await botClient.SendMessage(

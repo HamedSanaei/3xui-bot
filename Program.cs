@@ -172,6 +172,7 @@ public class Program
     /// The single IServiceSalesAvailability snapshot governs customer sale/renewal admission in every owned and tenant bot.
     /// TrialAccountLoggingSettings is shared by the super-admin UI and Telegram logger provider; it has no logger dependency
     /// and suppresses only new trial channel audits, retaining local diagnostics and financial backup intents.
+    /// PhoneVerificationSettings shares one persisted phone requirement across owned sales bots. Tenant flows retain their existing checks.
     /// TenantWeeklyUsageReportHostedService batches storefront-only analytics after Friday midnight Tehran and
     /// delivers owner charts exclusively through scoped Sales Assistant services, independently of the global report flag.
     /// PublicChannelPostManager is one shared singleton/hosted instance; it owns process-local preview/publication
@@ -211,6 +212,8 @@ public class Program
                 sp.GetRequiredService<ILogger<ClientDownloadAvailabilityService>>()));
         // No logger dependency: the Telegram logger provider itself consumes this global preference.
         services.AddSingleton(new TrialAccountLoggingSettings(
+            appConfig, Path.Combine(contentRootPath, "Data", "configuration.json")));
+        services.AddSingleton(new PhoneVerificationSettings(
             appConfig, Path.Combine(contentRootPath, "Data", "configuration.json")));
         // One persisted permission snapshot governs unpaid sale/renewal admission across every owned and tenant bot.
         services.AddSingleton<IServiceSalesAvailability>(sp =>

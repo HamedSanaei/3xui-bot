@@ -1,5 +1,11 @@
 # CODE_MAP.md
 
+- Owned phone verification: `PhoneVerificationSettings` persists the shared, live `ownedPhoneVerificationRequired`
+  root boolean in `Data/configuration.json` (default on). Only the private owned-bot super-admin panel can change it.
+  Owned `/start`, `/refresh` and join/menu entry check it after mandatory membership; existing XUI purchase, renewal
+  and trial checks and legacy ordinary trial admission read it live. Previously verified `CredUser.PhoneNumber` is shared
+  by Telegram user ID and retained. Tenant checks, trial limits and accepted payment settlement keep their existing rules.
+
 - `AppConfig.DatabaseCleanup` restores the existing startup section; absent/disabled leaves new diagnostic cleanup off.
   `DatabaseCleanupService` has bounded per-table batches/daily default and no financial/order/XUI-operation deletion.
   Inbox hourly pruning shares configurable >=7-day bounds, preserves unresolved/recently resolved review and XUI-linked
@@ -284,8 +290,9 @@
   Menus display `🌟اکانت تست`; the former label remains input-only for old keyboards. Ordinary trial policy is unchanged.
 
 - Tenant gateway/trial completion: `TenantBotService` logs readable customer gateways separately from owner funding
-  and routes `🌟اکانت تست` to `XuiV3BotFlowService.TryHandleTrialAsync`. Tenant and ordinary owned customers retain
-  non-colleague/verified-phone admission, 100 MiB national or 1 GiB normal, three days, thirty days per type/bot/user.
+  and routes `🌟اکانت تست` to `XuiV3BotFlowService.TryHandleTrialAsync`. Tenant phone admission stays required; owned
+  ordinary trial phone admission follows the owned switch. Trial limits remain 100 MiB national or 1 GiB normal,
+  three days, thirty days per type/bot/user.
   `TelegramPhoneVerification` shares owned/tenant Contact validation with each bot's own support/menu.
   `XuiV3PurchaseService` retains store, owner and recipient in tenant trial metadata; no tenant wallet/order/profit effects.
 

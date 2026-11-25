@@ -85,6 +85,10 @@ namespace Adminbot.Domain
         /// <remarks>Runtime readers use TrialAccountLoggingSettings.Snapshot. Applies to owned and tenant bots; never disables trials, local diagnostics or financial backups.</remarks>
         public bool TrialAccountLoggingEnabled { get; set; }
 
+        /// <summary>Initial phone-verification requirement for all owned sales bots. Defaults to enabled.</summary>
+        /// <remarks>Runtime checks use <see cref="PhoneVerificationSettings"/>. Tenant storefronts retain their existing requirements.</remarks>
+        public bool OwnedPhoneVerificationRequired { get; set; } = true;
+
         /// <summary>Initial global permission for new normal-service account sales; missing configuration keeps existing sales open.</summary>
         /// <remarks>Runtime admission must read IServiceSalesAvailability, not this startup value. Existing invoices and funded work remain settleable after closure.</remarks>
         public bool NormalSaleEnabled { get; set; } = true;

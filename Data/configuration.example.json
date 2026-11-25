@@ -13,6 +13,7 @@
   "tenantMaxStoresPerOwner": 5,
   "colleagueDailyFreeTrialLimit": 3,
   "trialAccountLoggingEnabled": false,
+  "ownedPhoneVerificationRequired": true,
   "normalSaleEnabled": true,
   "normalRenewalEnabled": true,
   "nationalSaleEnabled": true,
