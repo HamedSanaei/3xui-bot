@@ -85,12 +85,12 @@ public class User
     /// <summary>Durable owned purchase session identity, reused for creation and wallet debit after duplicate confirmation.</summary>
     public string PurchaseSessionId { get; set; }
     /// <summary>
-    /// Gets or sets the persisted evidence mode for a tenant renewal service-category decision.
+    /// Gets or sets the evidence mode for a renewal service-family decision in the active bot.
     /// </summary>
     /// <remarks>
     /// This compatibility DTO property is not mapped to the legacy <c>Users</c> table. It is stored only on the
-    /// bot-scoped <see cref="BotUserState" /> row and is copied to a tenant renewal order after live email/UUID and
-    /// service compatibility checks. Owned renewal flows leave it empty.
+    /// bot-scoped <see cref="BotUserState" /> row. Owned and tenant flows use it to revalidate compatible legacy choices.
+    /// Tenant renewal orders retain it for eventual provider activation and fulfillment checks.
     /// </remarks>
     [NotMapped]
     public string RenewalServiceResolutionMode { get; set; }

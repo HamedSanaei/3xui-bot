@@ -133,6 +133,8 @@ public partial class TenantBotService
     private const string TENANTRENEWSTEPEXTERNALTARGETCONFIRMATION = "renew-confirm-external-target";
     /// <summary>Tenant-scoped step that awaits an explicit category for a metadata-free ambiguous legacy account.</summary>
     private const string TENANTRENEWSTEPSERVICECATEGORY = "renew-service-category";
+    /// <summary>Bot-scoped step that waits for the customer to continue in the verified current service family.</summary>
+    private const string TENANTRENEWSTEPSAMESERVICE = "renew-same-service";
     private const string TENANTRENEWSTEPTRAFFIC = "renew-traffic";
     private const string TENANTRENEWSTEPDURATION = "renew-duration";
     private const string TENANTRENEWSTEPUNLIMITEDPLAN = "renew-unlimited-plan";
@@ -1124,7 +1126,7 @@ public partial class TenantBotService
     /// callbacks grant renewal only and never configuration, mutation, or ownership access. Before a selector is shown,
     /// the per-email detail comment is read and identity-checked so a positive-expiry unlimited account sharing normal
     /// inbounds cannot be misclassified from an incomplete list row.
-    /// The resolved category must also allow global renewal admission; sale permission is not consulted.
+    /// The resolved category must also allow global renewal admission. Known targets show the family before any plan choice.
     /// </remarks>
     private async Task HANDLETENANTRENEWFROMCALLBACKASYNC(
         ITelegramBotClient botClient,
@@ -1265,7 +1267,7 @@ public partial class TenantBotService
         {
             Id = customer.TelegramUserId,
             Flow = TENANTRENEWFLOW,
-            LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC,
+            LastStep = TENANTRENEWSTEPSAMESERVICE,
             ConfigLink = client.Email,
             SelectedCountry = service.Key,
             RenewTargetUuid = targetUuid,
@@ -1294,11 +1296,7 @@ public partial class TenantBotService
                 new[] { InlineKeyboardButton.WithCallbackData("بازگشت به منوی اصلی", XuiV3PurchaseCallbacks.Home()) }
             });
 
-        var selectedText =
-            $"اکانت انتخاب شد: <code>{Html(client.Email)}</code>\n" +
-            (service.IsUnlimited
-                ? "پلن تمدید نامحدود را انتخاب کنید."
-                : "حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.");
+        var selectedText = $"اکانت انتخاب شد: <code>{Html(client.Email)}</code>";
 
         if (callbackQuery.Message != null)
         {
@@ -1321,15 +1319,7 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendMessage(
-            chatId,
-            TenantRenewPricingPrompt(tenant, service, service.IsUnlimited
-                ? "یکی از پلن‌های زیر را انتخاب کنید:"
-                : $"یکی از حجم‌های زیر را انتخاب کنید یا عدد دلخواه بفرستید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است."),
-            replyMarkup: service.IsUnlimited
-                ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service, tenant),
-            cancellationToken: cancellationToken);
+        await SendTenantRenewSameServiceAsync(botClient, chatId, service, cancellationToken);
     }
 
     /// <summary>
@@ -4632,6 +4622,7 @@ public partial class TenantBotService
     /// services enter an explicit category step; only a choice from the freshly recomputed compatible set is persisted.
     /// A disabled unlimited sub-plan returns to the active tenant-priced plan keyboard before any order is created.
     /// Global renewal permission is checked for restored state and again for the freshly resolved category.
+    /// The same-service action advances only after the exact target and service have been resolved again.
     /// </remarks>
     /// <returns>A task that completes after the current state transition and its Telegram response.</returns>
     /// <exception cref="OperationCanceledException">
@@ -4730,8 +4721,9 @@ public partial class TenantBotService
                 await _state.SaveUserStatus(user);
                 await botClient.SendMessage(
                     message.Chat.Id,
+                    $"نوع انتخاب‌شده: {XuiCustomerServiceText.Label(selectedService)}\n" +
                     TenantRenewPricingPrompt(tenant, selectedService, selectedService.IsUnlimited
-                        ? "پلن تمدید نامحدود را انتخاب کنید:"
+                        ? "بستهٔ تمدید را انتخاب کنید:"
                         : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(selectedService)} GB است."),
                     replyMarkup: selectedService.IsUnlimited
                         ? BuildTenantRenewUnlimitedKeyboard(selectedService, tenant)
@@ -4745,7 +4737,6 @@ public partial class TenantBotService
                 await RecoverTenantRenewServiceSelectionAsync(
                     botClient,
                     message.Chat.Id,
-                    tenant,
                     user,
                     service,
                     effectiveResolutionMode,
@@ -4787,7 +4778,6 @@ public partial class TenantBotService
             await RecoverTenantRenewServiceSelectionAsync(
                 botClient,
                 message.Chat.Id,
-                tenant,
                 user,
                 service,
                 effectiveResolutionMode,
@@ -4802,6 +4792,25 @@ public partial class TenantBotService
         {
             user.RenewalServiceResolutionMode = effectiveResolutionMode;
             await _state.SaveUserStatus(user);
+        }
+
+        if (user.LastStep == TENANTRENEWSTEPSAMESERVICE)
+        {
+            if (text != XuiCustomerServiceText.RenewSame)
+            {
+                await SendTenantRenewSameServiceAsync(botClient, message.Chat.Id, service, cancellationToken);
+                return;
+            }
+
+            user.LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC;
+            await _state.SaveUserStatus(user);
+            await botClient.SendMessage(message.Chat.Id,
+                TenantRenewPricingPrompt(tenant, service, service.IsUnlimited
+                    ? "بستهٔ تمدید را انتخاب کنید:"
+                    : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است."),
+                replyMarkup: service.IsUnlimited ? BuildTenantRenewUnlimitedKeyboard(service, tenant) : BuildTenantRenewTrafficKeyboard(service, tenant),
+                cancellationToken: cancellationToken);
+            return;
         }
 
         if (user.LastStep == TENANTRENEWSTEPTRAFFIC)
@@ -5077,11 +5086,10 @@ public partial class TenantBotService
             return;
         }
 
-        await STARTTENANTRENEWPLANSELECTIONASYNC(
+        await StartTenantRenewSameFamilyAsync(
             botClient,
             message.Chat.Id,
             message.From.Id,
-            tenant,
             client,
             service,
             resolutionMode,
@@ -5290,7 +5298,6 @@ public partial class TenantBotService
     /// <param name="botClient">Telegram client of the tenant storefront.</param>
     /// <param name="chatId">Customer chat receiving the target and plan selector.</param>
     /// <param name="customerTelegramUserId">Telegram id whose state is replaced inside the current tenant bot scope.</param>
-    /// <param name="tenant">Active storefront whose pricing and plan visibility apply.</param>
     /// <param name="client">Fresh unique panel client selected for renewal.</param>
     /// <param name="service">Current enabled service resolved for the client.</param>
     /// <param name="resolutionMode">
@@ -5300,17 +5307,17 @@ public partial class TenantBotService
     /// <param name="canonicalUuid">Panel-derived UUID stored independently from later payment choice.</param>
     /// <param name="messageId">Warning message to edit after confirmation, or zero to send a new target message.</param>
     /// <param name="cancellationToken">Token that cancels users.db and Telegram operations.</param>
-    /// <returns>A task that completes after state replacement and plan-keyboard delivery.</returns>
+    /// <returns>A task that completes after state replacement and the same-family continuation prompt.</returns>
     /// <remarks>
     /// The target lock is stored whenever the panel supplies a valid UUID, including accounts already belonging to the
     /// customer. Owned legacy clients without UUID retain owner checks. No payable order or XUI side effect occurs here.
-    /// Global renewal permission is re-read before installing this bot-scoped selector state.
+    /// Global renewal permission is re-read before installing this bot-scoped selector state. Confirming the current
+    /// family gives access to the active storefront's priced choices on the next update.
     /// </remarks>
-    private async Task STARTTENANTRENEWPLANSELECTIONASYNC(
+    private async Task StartTenantRenewSameFamilyAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
         long customerTelegramUserId,
-        BotInstance tenant,
         XuiV3Client client,
         XuiV3ServiceDefinition service,
         string resolutionMode,
@@ -5326,7 +5333,7 @@ public partial class TenantBotService
         {
             Id = customerTelegramUserId,
             Flow = TENANTRENEWFLOW,
-            LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC,
+            LastStep = TENANTRENEWSTEPSAMESERVICE,
             ConfigLink = client.Email,
             SelectedCountry = service.Key,
             RenewTargetUuid = canonicalUuid,
@@ -5356,16 +5363,19 @@ public partial class TenantBotService
                 cancellationToken: cancellationToken);
         }
 
-        await botClient.SendMessage(
-            chatId,
-            TenantRenewPricingPrompt(tenant, service, service.IsUnlimited
-                ? "پلن تمدید نامحدود را انتخاب کنید:"
-                : $"حجم تمدید را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است."),
-            replyMarkup: service.IsUnlimited
-                ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service, tenant),
-            cancellationToken: cancellationToken);
+        await SendTenantRenewSameServiceAsync(botClient, chatId, service, cancellationToken);
     }
+
+    /// <summary>Displays the verified service and asks the customer to continue renewing it.</summary>
+    /// <param name="client">Active tenant storefront transport.</param>
+    /// <param name="chatId">Telegram chat receiving the reply keyboard.</param>
+    /// <param name="service">Freshly authorized catalog family of this storefront's exact renewal target.</param>
+    /// <param name="token">Cancellation of Telegram delivery.</param>
+    /// <remarks>This prompt does not mutate the account, reserve a payment or change the selected target.</remarks>
+    private static Task SendTenantRenewSameServiceAsync(ITelegramBotClient client, ChatId chatId,
+        XuiV3ServiceDefinition service, CancellationToken token) =>
+        client.SendMessage(chatId, $"نوع فعلی سرویس: {XuiCustomerServiceText.Label(service)}\nبرای ادامه، تمدید همین نوع سرویس را انتخاب کنید.",
+            replyMarkup: XuiCustomerServiceText.SameServiceKeyboard(), cancellationToken: token);
 
     /// <summary>
     /// Repairs a tenant renewal state whose saved service category no longer matches the target's authoritative comment.
@@ -5374,7 +5384,6 @@ public partial class TenantBotService
     /// Telegram client for the active tenant storefront. It is used only to show the corrected selector.
     /// </param>
     /// <param name="chatId">Tenant customer chat receiving the recovery message and replacement keyboard.</param>
-    /// <param name="tenant">
     /// Active tenant bot whose markup and tenant-visible unlimited plans determine displayed renewal prices.
     /// </param>
     /// <param name="user">
@@ -5390,27 +5399,27 @@ public partial class TenantBotService
     /// <param name="cancellationToken">Token that cancels users.db persistence and Telegram delivery.</param>
     /// <returns>A task that completes after the corrected tenant state and selector are delivered.</returns>
     /// <remarks>
-    /// This recovery has no payment, wallet, order, provider, or XUI mutation side effects. Empty strings are assigned
+    /// The customer must continue in the corrected family before choosing a plan. No payment, wallet, order, provider,
+    /// or XUI mutation occurs. Empty strings are assigned
     /// deliberately because partial user-state persistence treats <c>null</c> as "preserve the previous value".
     /// </remarks>
     /// <example>
     /// <code>
     /// await RecoverTenantRenewServiceSelectionAsync(
-    ///     botClient, chatId, tenant, state, resolvedService,
+    ///     botClient, chatId, state, resolvedService,
     ///     TenantRenewalServiceResolutionModes.Metadata, cancellationToken);
     /// </code>
     /// </example>
     private async Task RecoverTenantRenewServiceSelectionAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
-        BotInstance tenant,
         User user,
         XuiV3ServiceDefinition service,
         string resolutionMode,
         CancellationToken cancellationToken)
     {
         user.Flow = TENANTRENEWFLOW;
-        user.LastStep = service.IsUnlimited ? TENANTRENEWSTEPUNLIMITEDPLAN : TENANTRENEWSTEPTRAFFIC;
+        user.LastStep = TENANTRENEWSTEPSAMESERVICE;
         user.SelectedCountry = service.Key;
         user.RenewalServiceResolutionMode = resolutionMode;
         user.TotoalGB = string.Empty;
@@ -5421,12 +5430,10 @@ public partial class TenantBotService
 
         await botClient.SendMessage(
             chatId,
-            $"نوع سرویس اکانت از اطلاعات فعلی پنل دوباره تشخیص داده شد: <b>{Html(service.DisplayName)}</b>\n" +
-            TenantRenewPricingPrompt(tenant, service, "انتخاب قبلی کنار گذاشته شد. لطفاً گزینه تمدید مناسب این سرویس را انتخاب کنید."),
+            $"نوع سرویس اکانت از اطلاعات فعلی پنل دوباره تشخیص داده شد: <b>{Html(XuiCustomerServiceText.Label(service))}</b>\n" +
+            "انتخاب قبلی کنار گذاشته شد. برای ادامه، تمدید همین نوع سرویس را انتخاب کنید.",
             parseMode: ParseMode.Html,
-            replyMarkup: service.IsUnlimited
-                ? BuildTenantRenewUnlimitedKeyboard(service, tenant)
-                : BuildTenantRenewTrafficKeyboard(service, tenant),
+            replyMarkup: XuiCustomerServiceText.SameServiceKeyboard(),
             cancellationToken: cancellationToken);
     }
 
@@ -5515,11 +5522,10 @@ public partial class TenantBotService
             return;
         }
 
-        await STARTTENANTRENEWPLANSELECTIONASYNC(
+        await StartTenantRenewSameFamilyAsync(
             botClient,
             chatId,
             customer.TelegramUserId,
-            tenant,
             client,
             service,
             resolutionMode,
@@ -5668,7 +5674,6 @@ public partial class TenantBotService
             await RecoverTenantRenewServiceSelectionAsync(
                 botClient,
                 chatId,
-                tenant,
                 user,
                 service,
                 resolutionMode,
@@ -5744,7 +5749,7 @@ public partial class TenantBotService
         var text =
             "✅ <b>خلاصه تمدید اکانت</b>\n\n" +
             $"اکانت: <code>{Html(user.ConfigLink)}</code>\n" +
-            $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
+            $"سرویس: <b>{Html(XuiCustomerServiceText.Label(resolved.Service))}</b>\n" +
             trafficLine +
             $"مدت افزوده: <code>{Html(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
             (renewal == null ? string.Empty : $"مدت نهایی بعد از تمدید: <code>{Html(renewal.FinalDurationDays <= 0 ? "نامحدود" : renewal.FinalDurationDays + " روز")}</code>\n") +
@@ -5859,7 +5864,6 @@ public partial class TenantBotService
             await RecoverTenantRenewServiceSelectionAsync(
                 botClient,
                 chatId,
-                tenant,
                 user,
                 service,
                 resolutionMode,
@@ -6014,8 +6018,8 @@ public partial class TenantBotService
             .Where(IsTenantRenewalServiceVisible)
             .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal))
             .DistinctBy(service => service.Key, StringComparer.OrdinalIgnoreCase)
-            .OrderBy(service => service.DisplayName, StringComparer.Ordinal)
-            .Select(service => new[] { new KeyboardButton($"{service.DisplayName} [{service.Key}]") })
+            .OrderBy(XuiCustomerServiceText.Label, StringComparer.Ordinal)
+            .Select(service => new[] { new KeyboardButton(XuiCustomerServiceText.CategoryOption(service)) })
             .Append(new[] { new KeyboardButton("❌ انصراف") })
             .ToArray();
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
@@ -6035,19 +6039,8 @@ public partial class TenantBotService
         string text,
         IEnumerable<XuiV3ServiceDefinition> candidateServices)
     {
-        var normalized = text?.Trim();
-        if (string.IsNullOrWhiteSpace(normalized))
-            return null;
-
-        return (candidateServices ?? Array.Empty<XuiV3ServiceDefinition>())
-            .Where(IsTenantRenewalServiceVisible)
-            .FirstOrDefault(service =>
-                string.Equals(normalized, service.Key, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(normalized, service.DisplayName, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(
-                    normalized,
-                    $"{service.DisplayName} [{service.Key}]",
-                    StringComparison.OrdinalIgnoreCase));
+        return XuiCustomerServiceText.FindCategory(text,
+            (candidateServices ?? Array.Empty<XuiV3ServiceDefinition>()).Where(IsTenantRenewalServiceVisible));
     }
 
     /// <summary>
@@ -6115,7 +6108,8 @@ public partial class TenantBotService
             if (!_purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Renewal)) break;
             var selection = new XuiV3PurchaseSelection { ServiceKey = service.Key, UnlimitedPlanKey = plan.Key };
             if (!TryGetTenantSalePrice(tenant, selection, prices, out var price)) continue;
-            rows.Add(new[] { new KeyboardButton($"{plan.DisplayName} [{plan.Key}] - {price.FormatCurrency()}") });
+            rows.Add(new[] { new KeyboardButton(XuiCustomerServiceText.PackageOption(service, plan,
+                price.FormatCurrency(), includeReplyKey: true)) });
         }
         rows.Add(new[] { new KeyboardButton("❌ انصراف") });
         return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true };
@@ -7050,7 +7044,7 @@ public partial class TenantBotService
     /// <param name="tenant">Persisted tenant bot row whose pricing mode and rates control this menu; never use another owner's store.</param>
     /// <param name="CancellationToken">Token for Telegram delivery; no payment or database write occurs.</param>
     /// <param name="MessageId">Existing customer message id to edit, or null to send a new selection.</param>
-    /// <returns>A task after delivering available service buttons and a back action.</returns>
+    /// <returns>A task after delivering available family buttons, their explanations, and a back action.</returns>
     /// <remarks>When no globally open and priced choice remains, the customer sees an unavailable notice rather than a public-price fallback.
     /// Live sale permission and pricing are rechecked at selection and checkout; this menu never reserves an order.</remarks>
     private async Task SendServiceSelectionAsync(
@@ -7063,7 +7057,7 @@ public partial class TenantBotService
         var keyboard = BUILDTENANTSERVICEKEYBOARD(tenant);
         var Text = keyboard.InlineKeyboard.Count() == 1
             ? "در حال حاضر گزینه‌ای برای خرید در دسترس نیست. لطفاً بعداً دوباره تلاش کنید."
-            : "نوع سرویس مورد نظر را انتخاب کنید:";
+            : XuiCustomerServiceText.ExplainChoices("نوع سرویس مورد نظر را انتخاب کنید:", AvailableTenantSaleServices(tenant));
         if (MessageId.HasValue)
         {
             await SafeEditMessageTextAsync(botClient, ChatId, MessageId.Value, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
@@ -7073,23 +7067,32 @@ public partial class TenantBotService
         await botClient.SendMessage(ChatId, Text, replyMarkup: keyboard, cancellationToken: CancellationToken);
     }
 
-    /// <summary>Builds the currently priced service selector for one tenant storefront.</summary>
+    /// <summary>Builds the currently priced service selector for one tenant storefront using customer family labels.</summary>
     /// <param name="tenant">Storefront owning the active pricing mode and nullable manual prices.</param>
     /// <returns>Available service buttons and a back action even when nothing is priced.</returns>
     /// <remarks>Live global sale permission filters every category, independently of renewal. Unknown manual service keys and stale prices remain hidden without changing other stores.</remarks>
     private InlineKeyboardMarkup BUILDTENANTSERVICEKEYBOARD(BotInstance tenant)
     {
-        var prices = TenantUnlimitedPricesForList(tenant);
-        var rows = _purchaseService.GetEnabledServices()
-            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
-            .Where(service => IsTenantServicePriced(tenant, service, prices))
+        var rows = AvailableTenantSaleServices(tenant)
             .Select(service => new[]
             {
-                InlineKeyboardButton.WithCallbackData(service.DisplayName, CUSTOMERCALLBACKPREFIX + "svc:" + service.Key)
+                InlineKeyboardButton.WithCallbackData(XuiCustomerServiceText.Label(service), CUSTOMERCALLBACKPREFIX + "svc:" + service.Key)
             })
             .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "home") })
             .ToArray();
         return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>Finds live catalog services that can be priced for the current tenant customer.</summary>
+    /// <param name="tenant">Active storefront with its own pricing configuration.</param>
+    /// <returns>Eligible services for the customer menu and explanations, in catalog order.</returns>
+    /// <remarks>Filtering here never reserves an order or exposes another storefront's prices.</remarks>
+    private IEnumerable<XuiV3ServiceDefinition> AvailableTenantSaleServices(BotInstance tenant)
+    {
+        var prices = TenantUnlimitedPricesForList(tenant);
+        return _purchaseService.GetEnabledServices()
+            .Where(service => _purchaseService.SalesAvailability.IsEnabled(service, ServiceSalesOperation.Sale))
+            .Where(service => IsTenantServicePriced(tenant, service, prices));
     }
 
     /// <summary>
@@ -7110,6 +7113,7 @@ public partial class TenantBotService
     /// Selecting a metered service clears previous temporary choices before installing the traffic step. Removed,
     /// hidden, or unpriced manual choices return to the live menu. Unlimited plans decode one saved price map for
     /// the list and omit only unavailable plans. No order, wallet, payment, or XUI operation is performed.
+    /// Ready packages display the service family, fair-usage quota, term and current tenant price.
     /// Global sale permission is checked before any selector state is installed, including stale service buttons.
     /// </remarks>
     /// <exception cref="OperationCanceledException">
@@ -7161,7 +7165,7 @@ public partial class TenantBotService
                 rows.Add(new[]
                 {
                     InlineKeyboardButton.WithCallbackData(
-                        $"{plan.DisplayName} - {price.FormatCurrency()}",
+                        XuiCustomerServiceText.PackageOption(service, plan, price.FormatCurrency()),
                         CUSTOMERCALLBACKPREFIX + $"upl:{service.Key}:{plan.Key}")
                 });
             }
@@ -7169,7 +7173,7 @@ public partial class TenantBotService
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", CUSTOMERCALLBACKPREFIX + "services") });
 
             await EDITORSENDASYNC(botClient, ChatId, MessageId, hasChoices
-                ? "پلن مورد نظر را انتخاب کنید:" : "قیمت این گزینه در حال تنظیم است.",
+                ? $"{XuiCustomerServiceText.Label(service)}\nبستهٔ مورد نظر را انتخاب کنید:" : "قیمت این گزینه در حال تنظیم است.",
                 new InlineKeyboardMarkup(rows), CancellationToken);
             return;
         }
@@ -7190,7 +7194,7 @@ public partial class TenantBotService
             botClient,
             ChatId,
             MessageId,
-            $"حجم مورد نظر را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
+            $"{XuiCustomerServiceText.Label(service)}\nحجم مورد نظر را انتخاب کنید یا حجم دلخواه را به GB وارد کنید.\nحداقل حجم این سرویس {XuiV3PurchaseService.GetMinimumTrafficGb(service)} GB است.",
             BuildTenantTrafficInlineKeyboard(service),
             CancellationToken);
     }
@@ -7228,6 +7232,7 @@ public partial class TenantBotService
     /// custom durations, the prompt also publishes its inclusive day range. Each currently priced button uses
     /// <see cref="CalculateTenantPrice" />; missing or below-cost manual choices are unavailable rather than
     /// falling back to public. It sends Telegram text but creates no order or wallet mutation.
+    /// Each preset button shows the service family, selected traffic, duration and tenant price.
     /// Global sale closure prevents preset/custom-duration choices independently of renewal permission.
     /// </remarks>
     private async Task SHOWDURATIONOPTIONSASYNC(
@@ -7276,7 +7281,7 @@ public partial class TenantBotService
             rows.Add(new[]
             {
                 InlineKeyboardButton.WithCallbackData(
-                    $"{duration.DisplayName} - {price.FormatCurrency()}",
+                    $"{XuiCustomerServiceText.Label(service)} · {TrafficGb} گیگ · {duration.DisplayName} · {price.FormatCurrency()}",
                     CUSTOMERCALLBACKPREFIX + $"dur:{ServiceKey}:{TrafficGb}:{duration.Key}")
             });
         }
@@ -7474,7 +7479,7 @@ public partial class TenantBotService
     /// <param name="CancellationToken">Cancellation token for Telegram delivery.</param>
     /// <returns>A task that completes after the tenant-visible pre-invoice and payment choices are delivered.</returns>
     /// <remarks>
-    /// The shared resolver revalidates service, traffic, and duration before the summary is built. Customer-visible
+    /// The shared resolver revalidates service, traffic, and duration before presenting the service family and purchase terms. Customer-visible
     /// effective rates never expose colleague costs. Manual-mode previews always use an exact-message-bound
     /// persisted quote so an old callback cannot silently admit a changed rate; percentage mode keeps its legacy
     /// preview unless discount codes are enabled. No order, invoice, debit, ledger, or XUI mutation occurs here.
@@ -7508,7 +7513,7 @@ public partial class TenantBotService
         var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var priceBreakdownText = BuildTenantMeteredPriceBreakdownText(tenant, resolved, Price.SalePriceToman);
         var Text = "📌 <b>پیش‌فاکتور خرید</b>\n\n" +
-                   $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
+                   $"سرویس: <b>{Html(XuiCustomerServiceText.Label(resolved.Service))}</b>\n" +
                    (resolved.IsUnlimited
                        ? $"حد مصرف منصفانه: <code>{resolved.TrafficGb} GB</code>\n"
                        : $"حجم: <code>{resolved.TrafficGb} GB</code>\n") +

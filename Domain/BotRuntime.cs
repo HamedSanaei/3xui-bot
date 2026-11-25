@@ -690,12 +690,12 @@ namespace Adminbot.Domain
         /// </remarks>
         public int? PendingReceiptOrderDbId { get; set; }
         /// <summary>
-        /// Gets or sets the evidence mode for the temporary tenant renewal service category.
+        /// Gets or sets the evidence mode for the temporary owned or tenant renewal service family.
         /// </summary>
         /// <remarks>
         /// The value is scoped by <see cref="BotId" /> plus <see cref="TelegramUserId" /> and is cleared with the
-        /// conversation. It is copied to a tenant renewal order only after the exact email and UUID target and the live
-        /// compatible service set are revalidated. Owned renewal flows leave it empty.
+        /// conversation. Both flows revalidate the exact target and compatible family. A tenant renewal order also
+        /// retains this evidence for payment activation and fulfillment.
         /// </remarks>
         public string RenewalServiceResolutionMode { get; set; }
         public int AccountCounter { get; set; }

@@ -937,24 +937,27 @@ public class XuiV3PurchaseService
     /// </summary>
     /// <param name="serviceKey">Global service key from <c>xui-v3-service-plans.json</c>.</param>
     /// <param name="trafficGb">Previously selected traffic in whole GB, encoded into each callback.</param>
+    /// <param name="isColleague">Current owned-buyer role used for price display. Null preserves the legacy duration-only view.</param>
     /// <returns>An inline keyboard containing only enabled durations plus a back button.</returns>
     /// <remarks>
-    /// This method only builds Telegram callback data. The callback handler and <see cref="ResolvePurchase" /> must
-    /// still revalidate the duration because the catalog can change after the message is sent.
+    /// Displays the family, volume, term and authoritative role price when the caller supplies the role. The callback
+    /// handler and <see cref="ResolvePurchase" /> still revalidate the selection before payment.
     /// </remarks>
     /// <example>
     /// <code>
     /// var keyboard = purchaseService.BuildDurationKeyboard("normal", 30);
     /// </code>
     /// </example>
-    public InlineKeyboardMarkup BuildDurationKeyboard(string serviceKey, int trafficGb)
+    public InlineKeyboardMarkup BuildDurationKeyboard(string serviceKey, int trafficGb, bool? isColleague = null)
     {
         var service = FindService(serviceKey);
         var rows = GetEnabledDurationOptions(service)
             .Select(duration => new[]
             {
                 InlineKeyboardButton.WithCallbackData(
-                    duration.DisplayName,
+                    isColleague.HasValue
+                        ? $"{XuiCustomerServiceText.Label(service)} · {trafficGb} گیگ · {duration.DisplayName} · {CalculateMeteredPriceBreakdown(service, duration, trafficGb, isColleague.Value).TotalPriceToman.FormatCurrency()}"
+                        : duration.DisplayName,
                     XuiV3PurchaseCallbacks.Duration(service.Key, trafficGb, duration.Key))
             })
             .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.Service(service.Key)) })
@@ -972,6 +975,7 @@ public class XuiV3PurchaseService
     /// An inline keyboard containing only owned-authorized plans with a positive role price, followed by back navigation.
     /// </returns>
     /// <remarks>
+    /// Each button uses the customer-facing family title and shows its fair-usage quota, term and role price.
     /// Keyboard visibility is presentation only. Callback, restored state, preview, and confirmation handlers must use
     /// <see cref="ResolveOwnedPurchase" /> or the same central audience predicate before any side effect.
     /// </remarks>
@@ -988,7 +992,7 @@ public class XuiV3PurchaseService
             .Select(plan => new[]
             {
                 InlineKeyboardButton.WithCallbackData(
-                    $"{plan.DisplayName} - {plan.Price.GetForRole(isColleague).FormatCurrency()}",
+                    XuiCustomerServiceText.PackageOption(service, plan, plan.Price.GetForRole(isColleague).FormatCurrency()),
                     XuiV3PurchaseCallbacks.UnlimitedPlan(service.Key, plan.Key))
             })
             .Append(new[] { InlineKeyboardButton.WithCallbackData("بازگشت", XuiV3PurchaseCallbacks.BackToServices()) })
@@ -1057,7 +1061,7 @@ public class XuiV3PurchaseService
     /// value contains the per-account toman price and metered price breakdown.
     /// </param>
     /// <returns>
-    /// Plain Persian Telegram text containing the selected plan, per-account and total prices, and the detailed
+    /// Plain Persian Telegram text containing the service family, purchase terms, per-account and total prices, and the detailed
     /// metered calculation. The method does not reread the catalog or recalculate the price.
     /// </returns>
     /// <remarks>
@@ -1084,7 +1088,7 @@ public class XuiV3PurchaseService
         var accountCount = NormalizeAccountCount(selection.AccountCount);
         var totalPrice = resolved.PriceToman * accountCount;
         var text = "سفارش جدید\n";
-        text += $"نوع سرویس: {resolved.Service.DisplayName}\n";
+        text += $"نوع سرویس: {XuiCustomerServiceText.Label(resolved.Service)}\n";
         text += $"تعداد اکانت: {accountCount}\n";
         text += resolved.IsUnlimited
             ? $"حد مصرف منصفانه هر اکانت: {FormatTrafficSize(resolved.TrafficBytes, resolved.TrafficGb)}\n"

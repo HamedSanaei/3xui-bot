@@ -253,7 +253,7 @@ public partial class TenantBotService
     private bool HasPurchaseDiscountPaymentMethod(BotInstance tenant, long netToman, TenantAccessEvaluation funding) =>
         PurchaseDiscountPaymentMethods(tenant, netToman, funding).Count != 0;
 
-    /// <summary>Renders the persisted quote and binds a newly delivered or Telegram-confirmed already-visible message.</summary>
+    /// <summary>Renders the service family and persisted quote, then binds the delivered or Telegram-confirmed message.</summary>
     /// <param name="botClient">Required transport for the tenant bot that owns this quote and its Telegram message.</param>
     /// <param name="chatId">Original Telegram chat of this quote.</param>
     /// <param name="messageId">Positive Telegram edit target in the quote's chat, or null to send a new message.</param>
@@ -287,7 +287,7 @@ public partial class TenantBotService
         var resolved = _purchaseService.ResolveTenantPurchase(selection, false);
         var breakdown = BuildTenantMeteredPriceBreakdownText(tenant, resolved, quote.GrossToman);
         var text = "📌 <b>پیش‌فاکتور خرید</b>\n\n" +
-            $"سرویس: <b>{Html(resolved.Service.DisplayName)}</b>\n" +
+            $"سرویس: <b>{Html(XuiCustomerServiceText.Label(resolved.Service))}</b>\n" +
             (resolved.IsUnlimited ? $"حد مصرف منصفانه: <code>{resolved.TrafficGb} GB</code>\n" : $"حجم: <code>{resolved.TrafficGb} GB</code>\n") +
             $"مدت: <code>{(resolved.DurationDays <= 0 ? "نامحدود" : resolved.DurationDays + " روز")}</code>\n" +
             (string.IsNullOrWhiteSpace(breakdown) ? "" : $"\n{breakdown}\n") +

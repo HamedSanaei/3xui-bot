@@ -1,5 +1,11 @@
 # CODE_MAP.md
 
+- Customer XUI v3 service presentation uses `XuiCustomerServiceText` in owned and tenant purchase and renewal menus.
+  The three labels distinguish metered normal, fair-usage unlimited and national services without renaming catalog keys
+  or changing role/store prices. Known renewal targets show «تمدید همین نوع سرویس». Owned ambiguous legacy renewals
+  reuse the identity-checked tenant resolver and store a compatible choice in existing bot-scoped evidence fields.
+  Preview and the first mutation revalidate the type and exact target. Previously admitted renewal recovery keeps its own snapshot.
+
 - Tenant personal-card receipts: the receipt/outbox writer serializes a single pending image per
   `(TenantBotId, CustomerTelegramUserId)` across purchase, renewal and wallet charge. Existing duplicate pending images
   remain reviewable. The same check runs before card instructions. Audit-only rows and completed decisions are outside the slot.
