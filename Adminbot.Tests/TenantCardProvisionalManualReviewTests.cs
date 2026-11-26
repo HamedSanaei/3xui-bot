@@ -37,12 +37,17 @@ public sealed partial class ConcurrencyTests
         Assert.Null(await f.Wallet.GetWalletOperationAsync($"tenant:{f.Order.Id}:base-cost"));
     }
 
-    /// <summary>Central fulfillment upgrades the same identity, settles once, and duplicate/concurrent confirmations never create another client.</summary>
-    [Fact]
-    public async Task ProvisionalReview_central_recovery_concurrency_settles_once_and_preserves_frozen_target()
+    /// <summary>Central fulfillment upgrades the same identity, settles once, and concurrent confirmations never create another client.</summary>
+    /// <param name="identitySource">Reserved UUID, persisted GET UUID, or corroborated historical delivery evidence.</param>
+    /// <returns>A task proving preserved frozen entitlement and exactly one financial settlement per source.</returns>
+    [Theory]
+    [InlineData("reserved")]
+    [InlineData("verified")]
+    [InlineData("historical")]
+    public async Task ProvisionalReview_central_recovery_concurrency_settles_once_and_preserves_frozen_target(string identitySource)
     {
         using var dbs = new Databases(); await using var panel = await FakeUpstreamPanel.StartAsync();
-        using var f = await ProvisionalReviewFixture.CreateAsync(dbs, panel);
+        using var f = await ProvisionalReviewFixture.CreateAsync(dbs, panel, identitySource);
         var frozen = await f.Saga(); var id1 = await f.Prepare(); var id2 = await f.Prepare();
         Assert.NotNull(id1); Assert.NotNull(id2);
         var outcomes = await Task.WhenAll(f.Execute(id1!.Value), f.Execute(id2!.Value));
@@ -60,6 +65,60 @@ public sealed partial class ConcurrencyTests
         Assert.Single(await db.TenantBotLedgerEntries.ToListAsync()); Assert.Single(await db.WalletLedgerEntries.ToListAsync());
         Assert.NotEmpty(await db.TenantOrderNotifications.ToListAsync());
         Assert.Equal("provisional_identity_placement_mismatch", (await db.TenantCardProvisionalReviews.SingleAsync(x => x.Id == id1)).OriginalReason);
+    }
+
+    /// <summary>Historical and stored UUID proof fail closed if the identity or independent delivery evidence is changed.</summary>
+    /// <param name="scenario">One missing or conflicting input; all other data identifies the same paid order.</param>
+    /// <param name="reason">Expected sanitized diagnostic, without any panel credential or customer data.</param>
+    /// <returns>A task proving the read-only probe refuses without wallet, review or panel mutation.</returns>
+    [Theory]
+    [InlineData("missing_delivery", "creation_verified_uuid_missing")]
+    [InlineData("missing_metadata", "creation_verified_uuid_missing")]
+    [InlineData("live_metadata", "creation_live_provenance_mismatch")]
+    [InlineData("live_customer", "identity_mismatch")]
+    [InlineData("live_uuid", "identity_mismatch")]
+    [InlineData("live_subid", "identity_mismatch")]
+    [InlineData("get_failed", "panel_unavailable")]
+    [InlineData("duplicate_order", "identity_binding_ambiguous")]
+    [InlineData("original_uuid", "creation_identity_mismatch")]
+    [InlineData("stored_uuid", "creation_identity_mismatch")]
+    [InlineData("wrong_panel", "creation_identity_mismatch")]
+    [InlineData("wrong_owner", "creation_identity_mismatch")]
+    public async Task ProvisionalReview_panel_assigned_uuid_rejects_incomplete_or_conflicting_evidence(string scenario, string reason)
+    {
+        using var dbs = new Databases(); await using var panel = await FakeUpstreamPanel.StartAsync();
+        using var f = await ProvisionalReviewFixture.CreateAsync(dbs, panel, "historical");
+        var otherUuid = Guid.NewGuid().ToString("D");
+        await using (var db = dbs.Users.CreateDbContext())
+        {
+            var creation = await db.XuiV3CreationOperations.SingleAsync();
+            var payload = JObject.Parse(creation.ClientJson);
+            switch (scenario)
+            {
+                case "missing_delivery": (await db.TenantBotOrders.SingleAsync()).ProvisionalDeliveredAtUtc = null; break;
+                case "missing_metadata": payload.Remove("comment"); break;
+                case "live_metadata": panel.SetClientProvenance(f.Email, f.Customer, "{}"); break;
+                case "live_customer": panel.SetClientProvenance(f.Email, f.Customer + 1, payload["comment"]!.Value<string>()!); break;
+                case "live_uuid": panel.SetClientIdentity(f.Email, otherUuid, f.SubId); break;
+                case "live_subid": panel.SetClientIdentity(f.Email, f.Uuid, "other-subscription"); break;
+                case "get_failed": panel.HideClientDetail = true; break;
+                case "duplicate_order": db.Add(new TenantBotOrder { OrderId = "duplicate-review-identity", ProvisionalAccountEmail = f.Email }); break;
+                case "original_uuid": payload["uuid"] = otherUuid; break;
+                case "stored_uuid": creation.VerifiedPanelUuid = otherUuid; break;
+                case "wrong_panel": creation.PanelKey = "another-panel"; break;
+                case "wrong_owner": creation.TelegramUserId++; break;
+            }
+            creation.ClientJson = payload.ToString(Formatting.None);
+            await db.SaveChangesAsync();
+        }
+        var result = await f.Probe();
+        Assert.False(result.Eligible);
+        Assert.Equal(reason, result.Reason);
+        Assert.Equal(0, panel.TotalPostCount);
+        Assert.Equal(1_000_000, await f.Wallet.GetAccountBalance(f.Owner));
+        await using var check = dbs.Users.CreateDbContext();
+        Assert.Empty(await check.TenantCardProvisionalReviews.ToListAsync());
+        Assert.Empty(await check.WalletLedgerEntries.ToListAsync());
     }
 
     /// <summary>A depleted/expired courtesy client is enabled without rotating identity, then reset and upgraded on the same account.</summary>
@@ -323,11 +382,19 @@ public sealed partial class ConcurrencyTests
     {
         using var dbs = new Databases(initialize: false); await using var db = dbs.Users.CreateDbContext();
         var migrator = db.GetService<IMigrator>();
-        var previous = db.Database.GetMigrations().Last(x => !x.EndsWith("AddTenantCardProvisionalReviewedRecovery"));
+        var previous = db.Database.GetMigrations().TakeWhile(x => !x.EndsWith("AddTenantCardProvisionalReviewedRecovery")).Last();
         await migrator.MigrateAsync(previous);
         await db.Database.ExecuteSqlRawAsync("INSERT INTO TenantCardProvisionalOperations (Id,OperationKey,TenantBotOrderId,OrderId,Kind,Step,ErrorCode,FinalQuotaBytes,CreatedAtUtc,UpdatedAtUtc) VALUES (1,'old',694,'historic','finalize','manual_review','provisional_identity_placement_mismatch',107374182400,'2026-10-01','2026-10-01')");
+        const string originalRequest = "{\"email\":\"historical\",\"uuid\":null}";
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO XuiV3CreationOperations (OperationKey,PanelKey,TelegramUserId,ClientJson,InboundIdsJson,CreatedAtUtc,Outcome)
+            VALUES ('historical-create','panel',123,{originalRequest},'[1]','2026-10-01',2)
+            """);
         await db.Database.MigrateAsync();
         Assert.False(db.Database.HasPendingModelChanges());
+        var creation = await db.XuiV3CreationOperations.AsNoTracking().SingleAsync();
+        Assert.Equal(originalRequest, creation.ClientJson);
+        Assert.Null(creation.VerifiedPanelUuid);
         var row = await db.TenantCardProvisionalOperations.AsNoTracking().SingleAsync();
         Assert.Equal("manual_review", row.Step); Assert.Null(row.ReviewedRecoveryId); Assert.False(row.MutationPending);
         Assert.Equal(107374182400, row.FinalQuotaBytes); Assert.Empty(await db.TenantCardProvisionalReviews.ToListAsync());
@@ -361,8 +428,9 @@ public sealed partial class ConcurrencyTests
 
         /// <summary>Seeds exact approved order/creation evidence and the historical pre-mutation placement failure.</summary>
         /// <param name="dbs">Fresh isolated users/credentials databases.</param><param name="panel">Loopback panel owned by this test.</param>
+        /// <param name="identitySource">Reserved UUID, observed panel UUID, or historical delivered UUID and provenance.</param>
         /// <returns>Fixture with no live network dependency or production paths.</returns>
-        public static async Task<ProvisionalReviewFixture> CreateAsync(Databases dbs, FakeUpstreamPanel panel)
+        public static async Task<ProvisionalReviewFixture> CreateAsync(Databases dbs, FakeUpstreamPanel panel, string identitySource = "reserved")
         {
             var f = new ProvisionalReviewFixture();
             var catalog = WriteTenantCatalog(dbs, _ => { });
@@ -380,11 +448,20 @@ public sealed partial class ConcurrencyTests
             var resolved = purchase.ResolveTenantPurchase(new XuiV3PurchaseSelection { ServiceKey = "normal", TrafficGb = 50, DurationKey = "m1", AccountCount = 1 }, false);
             f.Inbounds = XuiV3PurchaseService.ResolveServiceInboundIds(resolved.Service).Order().ToArray();
             SeedProvisionalClient(panel, f.Email, f.Uuid, f.SubId, 999);
+            var createdAt = DateTime.UtcNow.AddMinutes(-5);
+            var provenance = JsonConvert.SerializeObject(new XuiV3ClientMetadata
+            {
+                CreatedAtUtc = createdAt, TelegramUserId = f.Customer, CreatedByTelegramUserId = f.Customer,
+                CreatedByBotId = tenant.Id, LastAction = "tenant-card-provisional",
+                PlanKey = TenantCardProvisionalProvisioningService.ProvisionalPlanKey, TrafficGb = 1, DurationDays = 1
+            });
+            panel.SetClientProvenance(f.Email, f.Customer, provenance);
             f.Order = new TenantBotOrder { OrderId = "TEST-PROVISIONAL-REVIEW", TenantBotId = tenant.Id, TenantBotUsername = tenant.Username,
                 OwnerTelegramUserId = f.Owner, CustomerTelegramUserId = f.Customer, PaymentProvider = "tenant_card", OrderKind = "purchase",
                 ServiceKey = "normal", TrafficGb = 50, DurationKey = "m1", AccountCount = 1, SalePriceToman = 200000, BaseCostToman = 100000,
                 PaymentStatus = "paid", ProvisionalDeliveryState = "manual_review", ProvisionalAccountEmail = f.Email,
-                ProvisionalAccountUuid = f.Uuid, ProvisionalSubId = f.SubId, UpdatedAtUtc = DateTime.UtcNow };
+                ProvisionalAccountUuid = f.Uuid, ProvisionalSubId = f.SubId, UpdatedAtUtc = DateTime.UtcNow,
+                ProvisionalCreatedAtUtc = createdAt.AddSeconds(3), ProvisionalDeliveredAtUtc = createdAt.AddSeconds(4) };
             await using (var db = dbs.Users.CreateDbContext())
             {
                 db.Add(tenant); db.Add(f.Order); await db.SaveChangesAsync();
@@ -394,8 +471,11 @@ public sealed partial class ConcurrencyTests
                 db.Add(receipt); await db.SaveChangesAsync(); f.Order.ManualReceiptId = receipt.Id; await db.SaveChangesAsync();
                 db.Add(new XuiV3CreationOperation { OperationKey = TenantCardProvisionalProvisioningService.BuildCreateOperationKey(f.Order.OrderId),
                     PanelKey = XuiV3LinkChangeOperationStore.BuildPanelKey(panel.ServerInfo), Outcome = XuiV3CreationOutcome.Applied,
-                    TelegramUserId = f.Customer, ClientJson = JsonConvert.SerializeObject(new XuiV3ClientPayload { Email = f.Email, Uuid = f.Uuid, SubId = f.SubId }),
-                    InboundIdsJson = JsonConvert.SerializeObject(f.Inbounds), CreatedAtUtc = DateTime.UtcNow }); await db.SaveChangesAsync();
+                    TelegramUserId = f.Customer, VerifiedPanelUuid = identitySource == "verified" ? f.Uuid : null,
+                    ClientJson = JsonConvert.SerializeObject(new XuiV3ClientPayload { Email = f.Email, Uuid = identitySource == "reserved" ? f.Uuid : null,
+                        SubId = f.SubId, TgId = f.Customer, Comment = provenance, TotalGB = OneGib }),
+                    InboundIdsJson = JsonConvert.SerializeObject(f.Inbounds), CreatedAtUtc = createdAt,
+                    PostStartedAtUtc = createdAt.AddSeconds(1), AppliedAtUtc = createdAt.AddSeconds(2) }); await db.SaveChangesAsync();
             }
             await using (var db = dbs.Credentials.CreateDbContext())
             { db.Users.AddRange(new CredUser { TelegramUserId = f.Owner, AccountBalance = 1000000 }, new CredUser { TelegramUserId = f.Customer }); await db.SaveChangesAsync(); }

@@ -223,12 +223,14 @@ public class ApiServicev3
     /// <remarks>
     /// Client identity is persisted before POST when a durable operation key is supplied. No SQLite transaction spans HTTP.
     /// A supplied tenant receipt must still be pending at the durable authorization of a courtesy POST.
+    /// Courtesy creation requires authenticated read-back UUID proof before delivering an account, even if the
+    /// add was accepted. A restart reuses the same reservation and performs GET only.
     /// A foreground network budget starts after reservation and covers the single POST, GET-only recovery, and optional
     /// detail/link retrieval together. Expiry retains ambiguity unless positive proof exists; positive proof is persisted
     /// independently of the network token and survives unavailable optional links. Caller cancellation still propagates.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The supplied foreground network budget is not positive.</exception>
-    /// <exception cref="InvalidOperationException">Bounded creation lacks a durable key/store, or reserved identity/placement conflicts with this request.</exception>
+    /// <exception cref="InvalidOperationException">Bounded or courtesy creation lacks a durable key/store, or the reservation conflicts with the request.</exception>
     /// <example><code>var result = await ApiServicev3.CreateUserAccountAsync(request, configuration, durableOptions, cancellationToken);</code></example>
     public static async Task<XuiV3AccountCreationResult> CreateUserAccountAsync(
         AccountDto accountDto,
@@ -237,6 +239,8 @@ public class ApiServicev3
         CancellationToken cancellationToken = default)
     {
         options ??= new XuiV3CreateAccountOptions();
+        if (RequiresVerifiedCourtesyUuid(options) && options.OperationStore == null)
+            throw new InvalidOperationException("Courtesy creation requires a durable operation store.");
         if (options.ForegroundNetworkBudget is { } requestedBudget)
         {
             if (requestedBudget <= TimeSpan.Zero)
@@ -274,7 +278,7 @@ public class ApiServicev3
                 ? ForegroundReadOverallHardCap
                 : options.ForegroundNetworkBudget.Value);
         XuiV3AccountCreationResult result;
-        if (reservation.Operation.Outcome == XuiV3CreationOutcome.Applied)
+        if (reservation.Operation.Outcome == XuiV3CreationOutcome.Applied && !RequiresVerifiedCourtesyUuid(options))
         {
             // Durable positive proof survives an unavailable follow-up GET; return the reserved known account.
             var knownGb = options.TrafficGb > 0 ? options.TrafficGb : Convert.ToInt32(accountDto.TotoalGB);
@@ -440,11 +444,12 @@ public class ApiServicev3
         }
     }
 
-    /// <summary>Persists authoritative creation proof even when its network lifetime or caller has just been cancelled.</summary>
+    /// <summary>Records panel application even when its network lifetime or caller has just been cancelled.</summary>
     /// <param name="options">Required creation options containing the original durable key/store; untracked legacy creations require no receipt write.</param>
     /// <returns>A task completing after Applied proof commits, or immediately when no durable operation is configured.</returns>
     /// <remarks>
-    /// Called only after an accepted POST or exact identity/inbound read-back. A separate fifteen-second local token
+    /// Called only after an accepted POST or exact identity/inbound read-back. POST acceptance does not prove a UUID;
+    /// tenant-card courtesy delivery separately records authenticated GET evidence. A fifteen-second local token
     /// prevents optional HTTP expiry from losing proof and authorizing compensation for an account that exists.
     /// No network request, wallet, ledger or tenant balance mutation runs inside this persistence step.
     /// </remarks>
@@ -457,6 +462,12 @@ public class ApiServicev3
         using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await options.OperationStore.MarkAppliedAsync(options.OperationKey, persistence.Token);
     }
+
+    /// <summary>Identifies tenant-card courtesy creations that must store a panel-assigned UUID before delivery.</summary>
+    /// <param name="options">Required creation options; the internal operation key, not customer input, identifies this path.</param>
+    /// <returns>True only for the tenant-card provisional-create namespace.</returns>
+    private static bool RequiresVerifiedCourtesyUuid(XuiV3CreateAccountOptions options)
+        => options.OperationKey?.StartsWith(Adminbot.Services.TenantCardProvisionalProvisioningService.CreateOperationPrefix, StringComparison.Ordinal) == true;
 
     /// <summary>
     /// Builds the final account creation result after the panel has accepted the add-client request.
@@ -475,7 +486,7 @@ public class ApiServicev3
     /// <param name="cancellationToken">Caller cancellation, distinct from the network deadline after positive creation proof.</param>
     /// <param name="networkCancellationToken">Shared creation network token cancelling this detail read and optional links.</param>
     /// <returns>
-    /// A successful creation result using the real panel client when it can be read, including the real UUID and subId.
+    /// A creation result using the real panel client when available. Courtesy results fail closed if the UUID is not proved.
     /// </returns>
     /// <remarks>
     /// The add-client endpoint can succeed while later reads are slow after a 3x-ui update. This method is deliberately
@@ -496,7 +507,8 @@ public class ApiServicev3
         CancellationToken cancellationToken,
         CancellationToken networkCancellationToken)
     {
-        var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken);
+        var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken,
+            suppressIdentifierBearingRetryLogs: RequiresVerifiedCourtesyUuid(options));
         var panelClient = panelClientResponse.Success && panelClientResponse.Obj != null
             ? panelClientResponse.Obj
             : null;
@@ -530,8 +542,8 @@ public class ApiServicev3
     /// <param name="cancellationToken">Caller cancellation; never cancelled by local network expiry alone.</param>
     /// <param name="networkCancellationToken">Original creation network lifetime for the optional link read; an expired lifetime skips that read.</param>
     /// <returns>
-    /// A successful creation result. The config link may be <c>null</c> when link retrieval fails after the account row
-    /// is already confirmed on the panel.
+    /// A successful creation result (possibly without a config link), or an unresolved courtesy result when authenticated
+    /// UUID proof cannot be recorded. Neither result permits replaying an already authorized POST.
     /// </returns>
     /// <remarks>
     /// Link lookup is best-effort once the panel client has been confirmed. Returning the real panel UUID is more
@@ -555,6 +567,17 @@ public class ApiServicev3
         CancellationToken networkCancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (RequiresVerifiedCourtesyUuid(options))
+        {
+            // Neither the POST response nor a derived subscription link attests the live client identity.
+            if (options.OperationStore == null || !MatchesReservedCreation(client, panelClient) ||
+                panelClient.InboundIds == null || !inboundIds.All(panelClient.InboundIds.Contains))
+                return UnverifiedCourtesyCreation(client.Email);
+            using var persistence = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            if (!await options.OperationStore.RecordVerifiedPanelUuidAsync(options.OperationKey,
+                XuiV3LinkChangeOperationStore.BuildPanelKey(accountDto.ServerInfo), panelClient, persistence.Token))
+                return UnverifiedCourtesyCreation(client.Email);
+        }
         XuiV3ApiResponse<List<string>> links = null;
         try
         {
@@ -607,6 +630,15 @@ public class ApiServicev3
             RawResponse = responseObj
         };
     }
+
+    /// <summary>
+    /// Returns an unresolved creation result when the courtesy UUID was not durably proved.
+    /// </summary>
+    /// <param name="email">Private reserved panel email, never logged here.</param>
+    /// <returns>An unresolved result; the caller retains the original operation and uses only GET on retry.</returns>
+    private static XuiV3AccountCreationResult UnverifiedCourtesyCreation(string email)
+        => new() { Success = false, ApiVersion = XuiPanelApiVersion.V3, Email = email,
+            Message = XuiV3UserSafeError.ForAccountCreation("creation result requires reconciliation") };
 
     /// <summary>
     /// Resolves the effective expiry value for a newly created XUI v3 client from all panel response shapes.
@@ -685,8 +717,8 @@ public class ApiServicev3
     /// <param name="cancellationToken">Caller cancellation used to distinguish shutdown from a handled local network expiry.</param>
     /// <param name="networkCancellationToken">Original creation network lifetime; an expired token prevents further recovery HTTP.</param>
     /// <returns>
-    /// A successful creation result when the panel contains the client; otherwise <c>null</c> so the caller can return a
-    /// controlled transient failure without creating a duplicate account.
+    /// The existing creation result after matching the panel client, an unresolved courtesy result when the UUID proof
+    /// could not be recorded, or <c>null</c> if the read did not identify the reserved client.
     /// </returns>
     /// <remarks>
     /// This is the duplicate-protection path for ambiguous network failures. It never sends another add-client request;
@@ -714,9 +746,10 @@ public class ApiServicev3
         using var stage = TelegramUpdateLatencyScope.Current?.Measure(TelegramUpdateStage.BusinessRecovery) ?? default;
         try
         {
-            var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken);
+            var panelClientResponse = await GetClientAsync(accountDto.ServerInfo, configuration, client.Email, networkCancellationToken,
+                suppressIdentifierBearingRetryLogs: RequiresVerifiedCourtesyUuid(options));
             if (!panelClientResponse.Success || !MatchesReservedCreation(client, panelClientResponse.Obj)
-                || !inboundIds.All(id => panelClientResponse.Obj.InboundIds.Contains(id)))
+                || panelClientResponse.Obj.InboundIds == null || !inboundIds.All(panelClientResponse.Obj.InboundIds.Contains))
                 return null;
             await MarkCreationAppliedAsync(options);
             Console.WriteLine("[XUIv3] Creation recovered by identity-safe read-back.");
@@ -1809,8 +1842,16 @@ public class ApiServicev3
         => SendAsync<JToken>(serverInfo, configuration, HttpMethod.Post, "/panel/api/clients/activeInbounds", null, true, cancellationToken);
 
     /// <summary>GET /panel/api/clients/traffic/{email}. Gets traffic counters for one client.</summary>
-    public static Task<XuiV3ApiResponse<XuiV3ClientTraffic>> GetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email, CancellationToken cancellationToken = default)
-        => SendAsync<XuiV3ClientTraffic>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/traffic/{EscapePath(email)}", null, true, cancellationToken);
+    /// <param name="serverInfo">Required authenticated panel connection; never log credentials.</param>
+    /// <param name="configuration">Runtime configuration for the panel request and timeouts.</param>
+    /// <param name="email">Exact private client identifier used only to address the GET.</param>
+    /// <param name="cancellationToken">Caller cancellation for this read-only request.</param>
+    /// <param name="suppressIdentifierBearingRetryLogs">True for sensitive review paths: use one attempt without URL-bearing retry diagnostics.</param>
+    /// <returns>The panel envelope with counters in bytes, which must be identity-checked by the caller before use.</returns>
+    public static Task<XuiV3ApiResponse<XuiV3ClientTraffic>> GetClientTrafficAsync(ServerInfo serverInfo, IConfiguration configuration, string email,
+        CancellationToken cancellationToken = default, bool suppressIdentifierBearingRetryLogs = false)
+        => SendAsync<XuiV3ClientTraffic>(serverInfo, configuration, HttpMethod.Get, $"/panel/api/clients/traffic/{EscapePath(email)}", null, true,
+            cancellationToken, retryMode: suppressIdentifierBearingRetryLogs ? XuiV3RequestRetryMode.NoAutomaticRetry : XuiV3RequestRetryMode.ReadOnly);
 
     /// <summary>
     /// Gets every protocol configuration URL for one client email across the inbounds attached by the XUI panel.

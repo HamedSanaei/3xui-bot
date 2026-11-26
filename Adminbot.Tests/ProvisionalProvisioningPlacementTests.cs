@@ -45,8 +45,12 @@ public sealed partial class ConcurrencyTests
     /// would make provisional delivery impossible. The panel assertions then prove the provisional quota, the provisional
     /// lifetime, and the configured inbound placement actually reached the wire request.
     /// </remarks>
-    [Fact]
-    public async Task Explicit_limit_provisioning_reuses_catalog_placement_without_pricing_validation()
+    /// <param name="loseFirstRead">True to lose the first GET after accepted POST and recover only by GET on repeat.</param>
+    /// <returns>A task proving one creation, immutable reserved identity and a separately stored read-back UUID.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Explicit_limit_provisioning_reuses_catalog_placement_without_pricing_validation(bool loseFirstRead)
     {
         using var databases = new Databases();
         var catalogPath = WriteTenantCatalog(databases, _ => { });
@@ -93,9 +97,22 @@ public sealed partial class ConcurrencyTests
         var serverInfo = new ServerInfo { Url = panel.Url, ApiToken = "test-only" };
         const string operationKey = "tenant-card-provisional-create:9001";
 
+        panel.HideClientReadBack = loseFirstRead;
         var created = await CreateProvisionalAsync(purchaseService, user, serverInfo, placement, operationKey);
 
+        if (loseFirstRead)
+        {
+            Assert.False(created.Success);
+            await using var db = databases.Users.CreateDbContext();
+            var incomplete = await db.XuiV3CreationOperations.AsNoTracking().SingleAsync();
+            Assert.Equal(XuiV3CreationOutcome.Applied, incomplete.Outcome);
+            Assert.Null(incomplete.VerifiedPanelUuid);
+            panel.HideClientReadBack = false;
+            created = await CreateProvisionalAsync(purchaseService, user, serverInfo, placement, operationKey);
+        }
+
         Assert.True(created.Success, created.Message);
+        Assert.Equal(panel.PanelUuid, created.Uuid);
         Assert.Equal(1, panel.PostCount);
         var postedClient = Assert.IsType<JObject>(panel.LastClient);
 
@@ -123,11 +140,19 @@ public sealed partial class ConcurrencyTests
             Assert.Contains("\"TrafficGb\":1", reservation.BusinessParametersJson);
             Assert.Contains("\"DurationDays\":1", reservation.BusinessParametersJson);
             Assert.Contains("provisional-1gb-1d", reservation.ClientJson);
+            var immutable = JObject.Parse(reservation.ClientJson);
+            Assert.True(immutable["uuid"] == null || immutable["uuid"]!.Type == JTokenType.Null);
+            Assert.Equal(panel.PanelUuid, reservation.VerifiedPanelUuid);
         }
 
         // Exactly-once: repeating the same provisional operation key must never issue another panel create.
         var repeated = await CreateProvisionalAsync(purchaseService, user, serverInfo, placement, operationKey);
         Assert.True(repeated.Success, repeated.Message);
+        Assert.Equal(1, panel.PostCount);
+
+        // Even an authenticated GET cannot replace a UUID already proved for this operation.
+        panel.PanelUuid = Guid.NewGuid().ToString("D");
+        Assert.False((await CreateProvisionalAsync(purchaseService, user, serverInfo, placement, operationKey)).Success);
         Assert.Equal(1, panel.PostCount);
     }
 
@@ -329,6 +354,12 @@ public sealed partial class ConcurrencyTests
         /// <summary>Gets the client object captured from the most recent add POST.</summary>
         public JObject? LastClient { get; private set; }
 
+        /// <summary>Panel-assigned UUID visible on authenticated GET only.</summary>
+        public string PanelUuid { get; set; } = "98d839ff-7397-483e-b0b7-f45f04c27f89";
+
+        /// <summary>Simulates a successful add whose immediate client lookup is unavailable.</summary>
+        public bool HideClientReadBack { get; set; }
+
         /// <summary>Gets the inbound id array captured from the most recent add POST.</summary>
         public JArray? LastInboundIds { get; private set; }
 
@@ -362,8 +393,13 @@ public sealed partial class ConcurrencyTests
                     return;
                 }
 
-                await context.Response.WriteAsync(
-                    new JObject { ["success"] = true, ["obj"] = panel.LastClient ?? new JObject() }.ToString());
+                var observed = panel.LastClient?.DeepClone() as JObject;
+                if (observed != null) observed["uuid"] = panel.PanelUuid;
+                await context.Response.WriteAsync(new JObject
+                {
+                    ["success"] = !panel.HideClientReadBack && observed != null,
+                    ["obj"] = panel.HideClientReadBack ? null : observed
+                }.ToString());
             });
             await app.StartAsync();
             panel._app = app;

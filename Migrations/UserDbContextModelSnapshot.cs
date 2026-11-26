@@ -3023,6 +3023,10 @@ namespace Adminbot.Migrations
 
             modelBuilder.Entity("Adminbot.Domain.XuiV3CreationOperation", b =>
                 {
+                    b.Property<string>("VerifiedPanelUuid")
+                        .HasMaxLength(36)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("OperationKey")
                         .HasMaxLength(240)
                         .HasColumnType("TEXT");

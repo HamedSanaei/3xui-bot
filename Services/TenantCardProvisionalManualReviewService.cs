@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace Adminbot.Services;
 
@@ -14,7 +15,7 @@ namespace Adminbot.Services;
 /// <param name="Binding">Private comparison digest; not displayed.</param>
 /// <param name="Snapshot">Mutable database version digest; not displayed.</param>
 /// <param name="Inbounds">Sorted catalog placement JSON; no customer data.</param>
-/// <param name="Evidence">Sanitized boolean/numeric proof only.</param>
+/// <param name="Evidence">Sanitized booleans, numeric proof and closed diagnostic labels only.</param>
 public sealed record TenantCardReviewProbe(int OrderId, bool Eligible, string Reason, string ResumeStep = null,
     string Binding = null, string Snapshot = null, string Inbounds = null, string Evidence = null);
 
@@ -108,7 +109,9 @@ public sealed class TenantCardProvisionalManualReviewService
     /// <param name="chatId">Private sender chat.</param><param name="token">Database/panel read cancellation.</param>
     /// <returns>Credential-free eligibility/refusal. A failed GET leaves every row untouched.</returns>
     /// <remarks>Only before-first-mutation placement failures can restart the saga. Partial/ambiguous writes require complete
-    /// frozen-target proof; reviewed proven deliveries preserve paid usage when retrying settlement.</remarks>
+    /// frozen-target proof; reviewed proven deliveries preserve paid usage when retrying settlement. A panel-assigned
+    /// UUID requires stored GET proof or corroborated historical delivery and live ownership evidence; neither path
+    /// changes the creation reservation or authorizes a new creation.</remarks>
     /// <example><code>var probe = await review.ProbeAsync(order.Id, adminId, ownedBotId, adminId, token);</code></example>
     public async Task<TenantCardReviewProbe> ProbeAsync(int orderId, long actor, string botId, long chatId, CancellationToken token)
     {
@@ -169,12 +172,28 @@ public sealed class TenantCardProvisionalManualReviewService
             RootPath = (_app.XuiV3ApiRootPath ?? "").Trim('/') };
         var creation = await db.XuiV3CreationOperations.AsNoTracking().SingleOrDefaultAsync(x => x.OperationKey ==
             TenantCardProvisionalProvisioningService.BuildCreateOperationKey(o.OrderId), token);
+        if (creation?.Outcome != XuiV3CreationOutcome.Applied || string.IsNullOrWhiteSpace(creation.ClientJson))
+            return Refuse("creation_evidence_invalid");
         XuiV3ClientPayload original;
-        try { original = creation == null ? null : JsonConvert.DeserializeObject<XuiV3ClientPayload>(creation.ClientJson); }
+        try { original = JsonConvert.DeserializeObject<XuiV3ClientPayload>(creation.ClientJson); }
         catch (JsonException) { return Refuse("creation_evidence_invalid"); }
-        if (creation?.Outcome != XuiV3CreationOutcome.Applied || creation.PanelKey != XuiV3LinkChangeOperationStore.BuildPanelKey(panel) ||
-            creation.TelegramUserId != o.CustomerTelegramUserId || original == null ||
-            !SameIdentity(original, o)) return Refuse("creation_evidence_invalid");
+        if (original == null)
+            return Refuse("creation_evidence_invalid");
+        if (creation.PanelKey != XuiV3LinkChangeOperationStore.BuildPanelKey(panel) ||
+            creation.TelegramUserId != o.CustomerTelegramUserId ||
+            !string.Equals(original.Email, o.ProvisionalAccountEmail, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(original.SubId ?? "", o.ProvisionalSubId ?? "", StringComparison.Ordinal) ||
+            (original.Uuid != null && !string.Equals(original.Uuid, o.ProvisionalAccountUuid, StringComparison.Ordinal)) ||
+            (creation.VerifiedPanelUuid != null && !string.Equals(creation.VerifiedPanelUuid, o.ProvisionalAccountUuid, StringComparison.Ordinal)))
+            return Refuse("creation_identity_mismatch");
+
+        var panelAssigned = original.Uuid == null;
+        var historical = panelAssigned && creation.VerifiedPanelUuid == null;
+        var historicalMetadata = historical ? HistoricalDeliveryEvidence(o, creation, original, s.FinalizationEffectiveAtUtc.Value) : null;
+        if (panelAssigned && (!Guid.TryParseExact(o.ProvisionalAccountUuid, "D", out var uuid) || uuid == Guid.Empty ||
+            original.TgId != o.CustomerTelegramUserId || string.IsNullOrWhiteSpace(original.SubId) ||
+            (historical && historicalMetadata == null)))
+            return Refuse("creation_verified_uuid_missing");
 
         // FIRST recovery requires zero financial artifacts. A fresh review of this protocol's proven delivery may
         // resume its matching receipt through the original settlement tail, never compensate or choose another route.
@@ -209,12 +228,18 @@ public sealed class TenantCardProvisionalManualReviewService
             return Refuse("financial_resume_uncertain");
         try
         {
-            var response = await ApiServicev3.GetClientAsync(panel, _configuration, o.ProvisionalAccountEmail, token);
+            var response = await ApiServicev3.GetClientAsync(panel, _configuration, o.ProvisionalAccountEmail, token,
+                suppressIdentifierBearingRetryLogs: true);
             if (response is not { Success: true, Obj: not null }) return Refuse("panel_unavailable");
             var client = response.Obj;
-            if (!SameIdentity(client, o)) return Refuse("identity_mismatch");
+            if (!SameIdentity(client, o) || (panelAssigned && !ApiServicev3.MatchesReservedCreation(original, client)))
+                return Refuse("identity_mismatch");
+            if (historical &&
+                !MatchesHistoricalProvenance(historicalMetadata, ReadCreationMetadata(client.Comment)))
+                return Refuse("creation_live_provenance_mismatch");
             if (client.InboundIds == null || !client.InboundIds.Distinct().Order().SequenceEqual(inbounds)) return Refuse("placement_mismatch");
-            var traffic = await ApiServicev3.GetClientTrafficAsync(panel, _configuration, o.ProvisionalAccountEmail, token);
+            var traffic = await ApiServicev3.GetClientTrafficAsync(panel, _configuration, o.ProvisionalAccountEmail, token,
+                suppressIdentifierBearingRetryLogs: true);
             if (traffic is not { Success: true, Obj: not null }) return Refuse("traffic_unavailable");
             if (!string.Equals(traffic.Obj.Email, o.ProvisionalAccountEmail, StringComparison.OrdinalIgnoreCase)) return Refuse("traffic_identity_mismatch");
             var zero = traffic.Obj.Up == 0 && traffic.Obj.Down == 0;
@@ -227,7 +252,8 @@ public sealed class TenantCardProvisionalManualReviewService
             var placement = JsonConvert.SerializeObject(inbounds);
             return new(o.Id, true, settlementResume ? "settlement_resume_proven" : "safe_recovery_proven", resume,
                 ReviewBinding.Binding(o, s, r, placement), ReviewBinding.Snapshot(o, s, r, placement), placement,
-                JsonConvert.SerializeObject(new { identity = true, placement = true, finalTarget = target, countersZero = zero,
+                JsonConvert.SerializeObject(new { identity = true, identitySource = historical ? "historical_delivery_and_get" :
+                    panelAssigned ? "verified_panel_uuid" : "reserved_uuid", placement = true, finalTarget = target, countersZero = zero,
                     quotaBytes = client.TotalGB, expiryTimeMs = client.ExpiryTime, resume }));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
@@ -338,6 +364,56 @@ public sealed class TenantCardProvisionalManualReviewService
     /// <param name="id">Internal order primary key.</param><param name="token">Read cancellation.</param><returns>Detached order or null.</returns>
     private async Task<TenantBotOrder> FindOrderAsync(int id, CancellationToken token)
     { await using var db = _factory.CreateDbContext(); return await db.TenantBotOrders.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, token); }
+
+    /// <summary>Requires independently recorded creation and delivery facts before a historical UUID can be checked live.</summary>
+    /// <param name="order">Order whose exact creation key, panel, customer and payment already passed review checks.</param>
+    /// <param name="creation">Applied reservation with no pre-POST UUID and no stored GET proof.</param>
+    /// <param name="original">Private pre-POST payload, not derived from the order or current panel.</param>
+    /// <param name="finalizationAt">Frozen UTC time at which paid finalization began.</param>
+    /// <returns>Private original metadata for live provenance comparison, or null if the historical timeline is incomplete.</returns>
+    /// <remarks>POST authorization, application, identity persistence and Telegram delivery must predate finalization.
+    /// No historic record is backfilled. The exact UUID on the delivered order still has to match a fresh panel GET.</remarks>
+    private static XuiV3ClientMetadata HistoricalDeliveryEvidence(TenantBotOrder order, XuiV3CreationOperation creation,
+        XuiV3ClientPayload original, DateTime finalizationAt)
+    {
+        if (creation.CreatedAtUtc == default || !creation.PostStartedAtUtc.HasValue || !creation.AppliedAtUtc.HasValue ||
+            !order.ProvisionalCreatedAtUtc.HasValue || !order.ProvisionalDeliveredAtUtc.HasValue ||
+            !(creation.CreatedAtUtc <= creation.PostStartedAtUtc && creation.PostStartedAtUtc <= creation.AppliedAtUtc &&
+              creation.AppliedAtUtc <= order.ProvisionalCreatedAtUtc && order.ProvisionalCreatedAtUtc <= order.ProvisionalDeliveredAtUtc &&
+              order.ProvisionalDeliveredAtUtc <= finalizationAt) || original.TotalGB != 1073741824L)
+            return null;
+        var metadata = ReadCreationMetadata(original.Comment);
+        return metadata != null && metadata.CreatedAtUtc <= creation.CreatedAtUtc &&
+               metadata.CreatedByBotId == order.TenantBotId && metadata.CreatedByTelegramUserId == order.CustomerTelegramUserId &&
+               metadata.TelegramUserId == order.CustomerTelegramUserId && metadata.LastAction == "tenant-card-provisional" &&
+               TenantCardProvisionalProvisioningService.IsProvisionalPlanKey(metadata.PlanKey) &&
+               metadata.PriceToman == 0 && metadata.TrafficGb == 1 && metadata.DurationDays == 1
+            ? metadata : null;
+    }
+
+    /// <summary>Parses an explicit historical creation timestamp from private client metadata.</summary>
+    /// <param name="comment">Nullable reserved or authenticated panel comment; never logged.</param>
+    /// <returns>Private metadata, or null when the JSON or explicit creation timestamp is missing or invalid.</returns>
+    private static XuiV3ClientMetadata ReadCreationMetadata(string comment)
+    {
+        if (string.IsNullOrWhiteSpace(comment)) return null;
+        try
+        {
+            var fields = JObject.Parse(comment);
+            return fields.GetValue(nameof(XuiV3ClientMetadata.CreatedAtUtc), StringComparison.OrdinalIgnoreCase)?.Value<DateTime?>() is { } created &&
+                created != default ? fields.ToObject<XuiV3ClientMetadata>() : null;
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidCastException or ArgumentException) { return null; }
+    }
+
+    /// <summary>Tests stable originating metadata without requiring mutable comment fields or JSON formatting to match.</summary>
+    /// <param name="reserved">Original metadata with independent creation proof.</param>
+    /// <param name="observed">Nullable metadata from the authenticated live client GET.</param>
+    /// <returns>True when the same creation timestamp, customer and storefront are independently observed.</returns>
+    private static bool MatchesHistoricalProvenance(XuiV3ClientMetadata reserved, XuiV3ClientMetadata observed)
+        => observed != null && observed.CreatedAtUtc == reserved.CreatedAtUtc &&
+           observed.CreatedByBotId == reserved.CreatedByBotId && observed.CreatedByTelegramUserId == reserved.CreatedByTelegramUserId &&
+           observed.TelegramUserId == reserved.TelegramUserId;
 
     /// <summary>Compares all immutable client credentials; a same-email replacement must fail closed.</summary>
     /// <param name="client">Private live or creation client payload; never log.</param><param name="order">Saved provisional order identity.</param>

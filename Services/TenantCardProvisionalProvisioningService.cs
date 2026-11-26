@@ -143,7 +143,10 @@ namespace Adminbot.Services
         /// <param name="publicOrderId">Public tenant order id; never a database id.</param>
         /// <returns>The stable key in <c>tenant-card-provisional-create:{orderId}</c> form.</returns>
         public static string BuildCreateOperationKey(string publicOrderId)
-            => $"tenant-card-provisional-create:{publicOrderId}";
+            => CreateOperationPrefix + publicOrderId;
+
+        /// <summary>Reserved namespace for tenant-card courtesy creation keys, which require durable UUID read-back.</summary>
+        internal const string CreateOperationPrefix = "tenant-card-provisional-create:";
 
         /// <summary>Determines whether a panel comment's plan key identifies a provisional courtesy account.</summary>
         /// <param name="planKey">Plan key read from a panel client comment, possibly <c>null</c>.</param>

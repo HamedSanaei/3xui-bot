@@ -166,6 +166,22 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
         }
     }
 
+    /// <summary>When true, the fake detail endpoint cannot return any client evidence.</summary>
+    public bool HideClientDetail { get; set; }
+
+    /// <summary>Seeds authenticated client ownership metadata for a historical read-back test.</summary>
+    /// <param name="email">Synthetic panel client key.</param>
+    /// <param name="customer">Synthetic Telegram owner id returned by the fake panel.</param>
+    /// <param name="comment">Private synthetic metadata JSON returned by the fake panel.</param>
+    public void SetClientProvenance(string email, long customer, string comment)
+    {
+        lock (_sync)
+        {
+            _clients[email]["tgId"] = customer;
+            _clients[email]["comment"] = comment;
+        }
+    }
+
     /// <summary>Sets the quota and expiry a client currently carries.</summary>
     /// <param name="email">Client email.</param>
     /// <param name="totalGb">Absolute quota in bytes currently configured on the client.</param>
@@ -428,7 +444,7 @@ internal sealed class FakeUpstreamPanel : IAsyncDisposable
             // state the renewal activation step must classify instead of mutating.
             JToken? found;
             lock (_sync)
-                found = _clients.TryGetValue(email, out var stored) ? stored.DeepClone() : null;
+                found = !HideClientDetail && _clients.TryGetValue(email, out var stored) ? stored.DeepClone() : null;
 
             await WriteSuccessAsync(context, found);
             return;

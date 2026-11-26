@@ -1695,6 +1695,10 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   corrected placement may reopen `claimed`; partial/uncertain work requires complete frozen-target GET proof or stays
   locked. Exact receipt/store/owner/customer/amount, Applied creation identity/panel, active service placement and absence
   of competing mutations/initial financial artifacts are mandatory. No new client, payment approval or settlement path.
+  Issue #12: courtesy creation stores write-once `VerifiedPanelUuid` from authenticated identity-matched GET, not POST
+  or links. Interrupted attempts remain GET-only, and `ClientJson` is immutable. Historical null UUIDs require a
+  durable creation/delivery timeline, original ownership metadata and a matching fresh live UUID/identity/provenance.
+  Migration `20261126145038_AddVerifiedPanelUuidToXuiCreation` is nullable and performs no historical backfill.
   Reviewed pre-dispatch markers prohibit ambiguous POST replay; proven settlement retries never reset paid usage.
   Existing tenant wallet receipt keys, tenant ledger uniqueness and fulfillment/outbox commit remain authoritative.
   Authorization fences stale receipt writers via UpdatedAtUtc; owner approve/reject, receipt ensure and transactional

@@ -22,7 +22,14 @@ No production order id, client id or inbound list is hardcoded in this implement
 ## Safety boundaries
 
 - An approved, finally confirmed receipt must uniquely match the order, storefront, owner, customer and amount.
-  The saved provisional creation must be `Applied` on the configured panel with the same credentials.
+  The saved provisional creation must be `Applied` on the configured panel for the same customer, email and SubId.
+  A reserved UUID must match exactly. New courtesy creates persist a write-once `VerifiedPanelUuid` from the
+  authenticated client GET, not the add response or a derived link. An interrupted lookup can recover by GET only.
+- Historical panel-assigned UUIDs without stored proof require the original courtesy metadata and the durable
+  reservation → POST authorization → application → identity persistence → Telegram delivery timeline before paid
+  finalization. A fresh GET must match the delivered UUID, reserved identity and original owner/store/creation timestamp.
+  An empty UUID alone is not permission. `creation_verified_uuid_missing` means proof is insufficient;
+  `creation_identity_mismatch` or `creation_live_provenance_mismatch` means the evidence conflicts.
 - Initial recovery refuses existing owner wallet receipts, tenant/wallet ledgers, funding routes or website debit artifacts.
   Revocation, ordinary creation, unresolved renewal and link-change operations also refuse admission.
 - Reviewed authorization freezes receipt evidence: linked receipt versions change in the claim transaction, stale workflow
@@ -50,6 +57,12 @@ No production order id, client id or inbound list is hardcoded in this implement
 Migration `20261030113439_AddTenantCardProvisionalReviewedRecovery` adds four saga fields and an **empty** review table
 with order/time and status/expiry indexes. Existing steps, frozen quota/expiry, receipt/payment, wallet and ledger rows
 are not rewritten. No backfill, automatic recovery, debit or panel request runs during migration/startup.
+
+Migration `20261126145038_AddVerifiedPanelUuidToXuiCreation` adds only a nullable column to the existing
+creation-operation row. It leaves `ClientJson` immutable and does not infer UUID evidence from orders.
+For historical orders such as #942, deploy and then use the read-only reprobe once placement is corrected.
+Check the reason before proceeding. Only a successful reprobe enables the existing separate administrator
+confirmation; the migration and the probe themselves never fulfill the order or settle balances.
 
 Before deploying, stop/drain the single application and create verified, matching SQLite online backups of **both**
 `users.db` and `credentials.db` (SQLite backup API / `.backup`, or copy only after a clean stop/checkpoint).

@@ -1,5 +1,6 @@
 using Adminbot.Domain;
 using Microsoft.EntityFrameworkCore;
+using Newtonsoft.Json;
 
 /// <summary>Reserves client identity exactly once before non-idempotent XUI provisioning.</summary>
 /// <remarks>Uses one short users.db transaction and no network I/O. Reservation and POST authorization are separate durable boundaries.</remarks>
@@ -77,6 +78,38 @@ public sealed class XuiV3CreationOperationStore
         return await db.XuiV3CreationOperations.Where(x => x.OperationKey == key && x.AppliedAtUtc == null)
             .ExecuteUpdateAsync(set => set.SetProperty(x => x.AppliedAtUtc, DateTime.UtcNow).SetProperty(x => x.Outcome, XuiV3CreationOutcome.Applied), ct);
     }, token);
+
+    /// <summary>Records the UUID observed by authenticated GET without rewriting the original creation reservation.</summary>
+    /// <param name="key">Required exact durable courtesy operation key used for the POST.</param>
+    /// <param name="panelKey">Hash of the endpoint that supplied the authenticated observation.</param>
+    /// <param name="observed">Private client returned from that endpoint; never use an add response or subscription link here.</param>
+    /// <param name="token">Independent cancellation for users.db persistence.</param>
+    /// <returns>True if the identity was committed or already proved identically; false for missing or conflicting evidence.</returns>
+    /// <remarks>Only the already Applied, POST-authorized operation may receive proof. The CAS never replaces a UUID
+    /// and performs no panel or financial work. A false result must not authorize delivery or another POST.</remarks>
+    internal Task<bool> RecordVerifiedPanelUuidAsync(string key, string panelKey, XuiV3Client observed, CancellationToken token)
+        => SqliteOperation.RunAsync(async ct =>
+        {
+            if (observed == null || !Guid.TryParseExact(observed.Uuid, "D", out var uuid) || uuid == Guid.Empty)
+                return false;
+            await using var db = _factory.CreateDbContext();
+            var row = await db.XuiV3CreationOperations.AsNoTracking().SingleOrDefaultAsync(x => x.OperationKey == key, ct);
+            if (row == null || row.PanelKey != panelKey || row.TelegramUserId <= 0 || string.IsNullOrWhiteSpace(row.ClientJson) ||
+                !row.PostStartedAtUtc.HasValue || !row.AppliedAtUtc.HasValue || row.Outcome != XuiV3CreationOutcome.Applied)
+                return false;
+            XuiV3ClientPayload reserved;
+            try { reserved = JsonConvert.DeserializeObject<XuiV3ClientPayload>(row.ClientJson); }
+            catch (JsonException) { return false; }
+            if (reserved == null || reserved.TgId != row.TelegramUserId || !ApiServicev3.MatchesReservedCreation(reserved, observed))
+                return false;
+
+            // A concurrent observation may confirm the same value; it must never replace existing evidence.
+            return await db.XuiV3CreationOperations.Where(x => x.OperationKey == key && x.PanelKey == panelKey
+                    && x.TelegramUserId == row.TelegramUserId && x.ClientJson == row.ClientJson
+                    && x.Outcome == XuiV3CreationOutcome.Applied
+                    && (x.VerifiedPanelUuid == null || x.VerifiedPanelUuid == observed.Uuid))
+                .ExecuteUpdateAsync(set => set.SetProperty(x => x.VerifiedPanelUuid, observed.Uuid), ct) == 1;
+        }, token);
 
     /// <summary>Atomically grants exactly one POST authorization for an unused reservation.</summary>
     /// <param name="key">Immutable business operation key already reserved in users.db; required.</param>

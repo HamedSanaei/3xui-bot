@@ -183,6 +183,7 @@ public class UserDbContext : DbContext
     /// Explicit false is an owner opt-out, preserved by runtime mapping and storefront reset; no customer/financial schema changes.
     /// Endpoint routing uses exact BotId plus BotFather identity, CAS Revision and separate operator ControlRevision.
     /// Endpoint history has no cascading foreign keys; independent alert intents deduplicate per incident and global superadmin.
+    /// Creation-operation UUID read-back evidence is optional and stays on the original operation key; the POST payload is not rewritten.
     /// Active customer restrictions use the storefront/customer composite key, with logical links to the bot and source receipt.
     /// The pending receipt lookup is nonunique to retain existing receipt evidence. No restrictions are inferred during migration.
     /// </remarks>
@@ -196,6 +197,7 @@ public class UserDbContext : DbContext
         {
             entity.HasKey(x => x.OperationKey);
             entity.Property(x => x.OperationKey).HasMaxLength(240);
+            entity.Property(x => x.VerifiedPanelUuid).HasMaxLength(36);
             entity.HasIndex(x => new { x.TelegramUserId, x.CreatedAtUtc });
             entity.HasIndex(x => x.InboxSequence);
         });

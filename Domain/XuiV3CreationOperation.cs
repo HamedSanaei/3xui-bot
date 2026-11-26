@@ -18,6 +18,10 @@ public sealed class XuiV3CreationOperation
     public long TelegramUserId { get; set; }
     /// <summary>Private immutable client payload, persisted before the first POST.</summary>
     public string ClientJson { get; set; }
+    /// <summary>Private UUID independently observed in an authenticated XUI client GET for this reservation.</summary>
+    /// <remarks>Write-once, bound to this operation's panel, owner, reserved email and SubId. Null means no stored
+    /// read-back proof, including historical rows. Never log it or use it to authorize another POST.</remarks>
+    public string VerifiedPanelUuid { get; set; }
     /// <summary>Immutable ordered inbound ids supplied to the only permitted creation attempt.</summary>
     public string InboundIdsJson { get; set; }
     /// <summary>Immutable quota, duration, IP-limit and flow inputs; excludes generated identities and timestamps.</summary>
