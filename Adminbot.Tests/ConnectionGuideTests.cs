@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
 using Telegram.Bot.Types;
+using Telegram.Bot.Types.ReplyMarkups;
 using Xunit;
 
 public sealed partial class ConcurrencyTests
@@ -59,10 +60,13 @@ public sealed partial class ConcurrencyTests
         Assert.Contains(ClientDownloadCallbacks.DisabledMessage, guideClient.Answers);
     }
 
-    /// <summary>A successful owned panel purchase keeps its subscription link and adds the guide in the same QR message.</summary>
+    /// <summary>A successful owned panel purchase keeps its subscription link and uses one inline row on the same QR message.</summary>
+    /// <param name="downloadsEnabled">Live global permission to show the independent download action.</param>
     /// <returns>A task exercising purchase confirmation, local wallet settlement and Telegram delivery through production handlers.</returns>
-    [Fact]
-    public async Task Paid_owned_purchase_delivers_the_connection_guide_with_its_subscription_link()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Paid_owned_purchase_delivers_the_connection_guide_with_its_subscription_link(bool downloadsEnabled)
     {
         const long customerId = 725;
         const string subscriptionBase = "https://example.invalid/sub";
@@ -90,7 +94,7 @@ public sealed partial class ConcurrencyTests
             await context.Response.WriteAsync(new JObject { ["success"] = true, ["obj"] = result }.ToString());
         });
         await panel.StartAsync();
-        var flag = new ClientDownloadAvailabilityProbe(enabled: true);
+        var flag = new ClientDownloadAvailabilityProbe(enabled: downloadsEnabled);
         await using var provider = StorefrontProvider(databases, panelUrl: panel.Urls.Single(), configureServices: services =>
         {
             var current = (IConfiguration)services.Last(service => service.ServiceType == typeof(IConfiguration)).ImplementationInstance!;
@@ -134,8 +138,8 @@ public sealed partial class ConcurrencyTests
         }
         Assert.True(client.SinglePhotoCaptions.Count == 1, string.Join(Environment.NewLine, client.Texts));
         Assert.Contains(subscriptionBase, client.SinglePhotoCaptions[0]);
-        Assert.Contains("owned:tutorial:guide:open", client.Callbacks);
-        Assert.Contains("📲 دانلود نرم‌افزار و راهنمای اتصال", client.Labels);
+        var sentKeyboard = Assert.Single(client.InlineKeyboards, keyboard => keyboard.IsPhoto);
+        AssertPurchaseGuideRow(sentKeyboard.Markup, ConnectionGuideFlow.OwnedPrefix, downloadsEnabled);
         Assert.True(await credentials.GetAccountBalance(customerId) < 1_000_000);
     }
 
@@ -188,12 +192,14 @@ public sealed partial class ConcurrencyTests
         Assert.Equal("amount", (await state.GetUserStatus(customerId)).LastStep);
     }
 
-    /// <summary>Tenant fulfillment and resend place the guide only on the buyer's new purchase message.</summary>
+    /// <summary>Tenant fulfillment and resend keep the guide and enabled download action together on the buyer's purchase message.</summary>
     /// <param name="hasLink">True to exercise QR delivery, false to exercise the text fallback.</param>
-    /// <param name="downloadsEnabled">Live global setting used to label the purchase guide button.</param>
+    /// <param name="downloadsEnabled">Live global setting controlling the presence of the separate download action.</param>
     /// <returns>A task verifying purchase and renewal sends with the real outbox and resend renderers.</returns>
     [Theory]
     [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
     [InlineData(false, false)]
     public async Task Storefront_connection_guide_is_on_purchase_delivery_and_resend_only(bool hasLink, bool downloadsEnabled)
     {
@@ -218,9 +224,12 @@ public sealed partial class ConcurrencyTests
             Assert.NotNull(await delivery.SendAsync(order, TenantOrderNotificationKinds.CustomerAccountDelivery, default));
             var client = clients[order.TenantBotId];
             Assert.True(await (Task<bool>)resend.Invoke(tenant, new object[] { order, true, false, CancellationToken.None })!);
-            Assert.Equal(new[] { "TN:guide:open", "TN:guide:open" }, client.Callbacks);
-            Assert.All(client.Labels, label => Assert.Equal(downloadsEnabled
-                ? "📲 دانلود نرم‌افزار و راهنمای اتصال" : "📲 راهنمای اتصال", label));
+            Assert.Equal(2, client.InlineKeyboards.Count);
+            Assert.All(client.InlineKeyboards, keyboard =>
+            {
+                Assert.Equal(hasLink, keyboard.IsPhoto);
+                AssertPurchaseGuideRow(keyboard.Markup, ConnectionGuideFlow.TenantPrefix, downloadsEnabled);
+            });
             Assert.Equal(hasLink ? 2 : 0, client.SinglePhotoSends);
             if (hasLink)
                 Assert.All(client.SinglePhotoCaptions, caption => Assert.Contains(order.CreatedSubLink!, caption));
@@ -230,8 +239,51 @@ public sealed partial class ConcurrencyTests
             order.OrderKind = TenantBotOrderKinds.Renew;
             Assert.NotNull(await delivery.SendAsync(order, TenantOrderNotificationKinds.CustomerAccountDelivery, default));
             Assert.True(await (Task<bool>)resend.Invoke(tenant, new object[] { order, true, false, CancellationToken.None })!);
-            Assert.Equal(2, client.Callbacks.Count);
+            Assert.Equal(2, client.InlineKeyboards.Count);
         }
+    }
+
+    /// <summary>The purchase download button enters the existing software selector and stops working when downloads are disabled.</summary>
+    /// <param name="tenant">True to verify the tenant navigation callback; false for the owned handler.</param>
+    /// <returns>A task proving the real purchase callback opens the shared menu without release lookup, then fails closed after a live toggle.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Purchase_download_button_opens_existing_menu_and_obeys_live_availability(bool tenant)
+    {
+        using var databases = new Databases();
+        var flag = new ClientDownloadAvailabilityProbe(enabled: true);
+        var releases = new CountingReleaseService();
+        var client = new GatewayTelegramClient();
+        object service = tenant ? BuildClientDownloadTenantService(databases, flag, releases)
+            : BuildClientDownloadTelegramService(databases, flag, releases, client);
+        var prefix = tenant ? ConnectionGuideFlow.TenantPrefix : ConnectionGuideFlow.OwnedPrefix;
+        var row = Assert.Single(ConnectionGuideFlow.BuildPurchaseMarkup(prefix, flag.Snapshot.Enabled).InlineKeyboard);
+        var payload = Assert.Single(row, button => button.Text == "📥 دانلود آخرین نسخه").CallbackData!;
+
+        await InvokeDownloadNavigationAsync(service, client, payload);
+        var menu = Assert.IsType<InlineKeyboardMarkup>(Assert.Single(client.Sends).ReplyMarkup);
+        Assert.Equal(new[] { "APPDL:android", "APPDL:ios", "APPDL:windows", "APPDL:happ" },
+            menu.InlineKeyboard.SelectMany(buttons => buttons).Select(button => button.CallbackData));
+
+        flag.SetEnabled(false);
+        await InvokeDownloadNavigationAsync(service, client, payload);
+        Assert.Single(client.Sends);
+        Assert.Equal(ClientDownloadCallbacks.DisabledMessage, client.Answers[^1].Text);
+        Assert.Equal(0, releases.Calls);
+    }
+
+    /// <summary>Verifies exact delivery labels and routing without flattening away the Telegram row layout.</summary>
+    /// <param name="markup">Captured keyboard attached to the message or QR photo under test.</param>
+    /// <param name="guidePrefix">Expected owned or tenant callback prefix for the guide action.</param>
+    /// <param name="downloadsEnabled">True when a second button must appear on the same row.</param>
+    private static void AssertPurchaseGuideRow(InlineKeyboardMarkup markup, string guidePrefix, bool downloadsEnabled)
+    {
+        var row = Assert.Single(markup.InlineKeyboard);
+        (string Text, string? CallbackData)[] expected = downloadsEnabled
+            ? [("📲 راهنمای اتصال", guidePrefix + "open"), ("📥 دانلود آخرین نسخه", "APPDL:menu")]
+            : [("📲 راهنمای اتصال", guidePrefix + "open")];
+        Assert.Equal(expected, row.Select(button => (button.Text, button.CallbackData)));
     }
 
     /// <summary>Creates a synthetic guide callback carrying a private Telegram chat and no account identifiers.</summary>

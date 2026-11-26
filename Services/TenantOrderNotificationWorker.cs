@@ -42,7 +42,7 @@ public sealed class TenantOrderNotificationDeliveryService
     private readonly SalesAssistantService _salesAssistantService;
     private readonly TenantOwnerNotificationTransportResolver _ownerTransportResolver;
     private readonly UserDbContextFactory _userDbContextFactory;
-    /// <summary>Live global download switch used to label the guide at the time of outbox delivery.</summary>
+    /// <summary>Live global switch controlling the download action beside the guide at the time of purchase outbox delivery.</summary>
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
 
     /// <summary>Creates a sender for committed tenant order notifications.</summary>

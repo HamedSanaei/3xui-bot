@@ -112,7 +112,7 @@ public partial class XuiV3BotFlowService
     private readonly TelegramInteractionTimeouts _interactionTimeouts;
     /// <summary>Live owned-bot phone preference. Existing tenant checks remain mandatory.</summary>
     private readonly PhoneVerificationSettings _phoneVerification;
-    /// <summary>Live global download switch used only to label the owned purchase guide button.</summary>
+    /// <summary>Live global switch controlling the download action beside the guide on owned purchase delivery.</summary>
     private readonly IClientDownloadAvailability _clientDownloadAvailability;
 
     /// <summary>

@@ -24,21 +24,26 @@ internal static class ConnectionGuideFlow
     /// <summary>Opens the built-in album for an exact platform kind.</summary>
     private const string LessonPrefix = "lesson:";
 
-    /// <summary>Builds the single connection guide button to attach to an owned or tenant purchase delivery.</summary>
+    /// <summary>Builds the connection guide and optional direct download action on one row of a purchase delivery.</summary>
     /// <param name="callbackPrefix">Fixed <see cref="OwnedPrefix"/> or <see cref="TenantPrefix"/> chosen by the sender.</param>
     /// <param name="downloadsEnabled">Live application-wide download switch at the time the message is sent.</param>
-    /// <returns>An inline keyboard with the guide button and no account identifiers.</returns>
-    /// <remarks>Only successful new purchases use this markup. The button still opens the chooser after the switch changes.</remarks>
+    /// <returns>One inline row with the guide first and, when enabled, the download menu action beside it. Neither carries account identifiers.</returns>
+    /// <remarks>Only successful new purchases use this markup. The guide always opens the chooser; the existing
+    /// download-menu handler rechecks live permission when the customer clicks. This builder performs no I/O.</remarks>
     /// <example><code>var markup = ConnectionGuideFlow.BuildPurchaseMarkup(ConnectionGuideFlow.OwnedPrefix, downloadsEnabled);</code></example>
-    internal static InlineKeyboardMarkup BuildPurchaseMarkup(string callbackPrefix, bool downloadsEnabled) =>
-        new(new[] { InlineKeyboardButton.WithCallbackData(
-            downloadsEnabled ? "📲 دانلود نرم‌افزار و راهنمای اتصال" : MenuCommand,
-            callbackPrefix + OpenAction) });
+    internal static InlineKeyboardMarkup BuildPurchaseMarkup(string callbackPrefix, bool downloadsEnabled)
+    {
+        var guide = InlineKeyboardButton.WithCallbackData(MenuCommand, callbackPrefix + OpenAction);
+        var row = downloadsEnabled
+            ? new[] { guide, InlineKeyboardButton.WithCallbackData("📥 دانلود آخرین نسخه", ClientDownloadCallbacks.PlatformMenuCallback) }
+            : new[] { guide };
+        return new InlineKeyboardMarkup(new[] { row });
+    }
 
     /// <summary>Selects guide markup for messages sent to the buyer from a fulfilled tenant order.</summary>
     /// <param name="order">Stored tenant order used by the buyer's delivery or resend path.</param>
     /// <param name="downloadsEnabled">Live application-wide download switch at send time.</param>
-    /// <returns>Guide markup for a purchase, or null for renewals and other order kinds.</returns>
+    /// <returns>One row containing the guide and any enabled download action for a purchase, or null for renewals and other order kinds.</returns>
     /// <remarks>Use only for buyer delivery. Owner and sales-assistant notifications have separate send paths.</remarks>
     internal static InlineKeyboardMarkup BuildTenantPurchaseMarkup(TenantBotOrder order, bool downloadsEnabled) =>
         string.Equals(order.OrderKind, TenantBotOrderKinds.Purchase, StringComparison.OrdinalIgnoreCase)
