@@ -411,7 +411,7 @@ public partial class TelegramBotService
     /// so support, activity attribution, and Telegram delivery remain scoped to the active owned or tenant bot.
     /// Public-channel composition and publication are delegated to the shared manager using the explicit source bot
     /// and sender/private-chat identity; this scoped service never performs target probes or media downloads.
-    /// The owned charge service uses the registered default bot and shared credentials role to freeze campaign offers.
+    /// The owned charge service verifies the exact registered owned bot and private wallet target before freezing campaign offers.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The required public-channel manager or trial logging settings dependency is null.</exception>
     /// <example><code>var handler = scope.ServiceProvider.GetRequiredService&lt;TelegramBotService&gt;();</code></example>

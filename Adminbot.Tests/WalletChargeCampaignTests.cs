@@ -10,17 +10,17 @@ using Xunit;
 
 public sealed partial class ConcurrencyTests
 {
-    /// <summary>Every active gateway freezes the same base-only offer for both eligible owned audiences before HTTP.</summary>
+    /// <summary>Every gateway freezes the same base-only offer for both roles on both owned origins before HTTP.</summary>
     /// <param name="gateway">Configured central payment gateway; only fake HTTP is issued.</param>
     /// <param name="provider">Canonical durable provider key.</param>
-    /// <returns>Verifies a single official principal and gift, even after campaign pause, restart, and concurrent recovery.</returns>
+    /// <returns>Verifies one official principal and at most one gift across pause, restart, concurrent recovery and disabled issuance.</returns>
     [Theory]
     [InlineData(PaymentGateway.HooshPay, "hooshpay")]
     [InlineData(PaymentGateway.Tetraminator, "tetraminator")]
     [InlineData(PaymentGateway.UniquePay, "uniquepay")]
     [InlineData(PaymentGateway.AtlasPay, "atlaspay")]
     [InlineData(PaymentGateway.NowPayments, "nowpayments")]
-    public async Task WalletCampaign_Official_owned_charge_is_frozen_and_applied_for_both_audiences(PaymentGateway gateway, string provider)
+    public async Task WalletCampaign_Official_owned_charge_is_frozen_for_all_owned_roles_and_origins(PaymentGateway gateway, string provider)
     {
         using var databases = new Databases();
         var wallet = new CredentialsStore(databases.Credentials);
@@ -46,18 +46,19 @@ public sealed partial class ConcurrencyTests
         var referrals = new ReferralService(config, databases.Users, wallet, ledger, null!, NullLogger<ReferralService>.Instance);
         const long principal = 100000;
         const string callback = "https://merchant.example/return";
-        foreach (var isColleague in new[] { false, true })
+        foreach (var (isColleague, useDefaultBot, enabled, userId) in new[]
+                 { (false, false, true, 123L), (true, false, true, 456L), (false, true, true, 789L),
+                   (true, true, true, 987L), (false, false, false, 321L) })
         {
-            const string partnerBot = "brand-b";
-            var botId = isColleague ? partnerBot : registry.DefaultBot.Id;
-            var userId = isColleague ? 456L : 123L;
-            await wallet.AddEmptyUser(userId);
+            var botId = useDefaultBot ? registry.DefaultBot.Id : "brand-b";
+            var expectedGift = enabled ? 20000L : 0L;
+            await wallet.GetUserStatus(new CredUser { TelegramUserId = userId, ChatID = userId });
             if (isColleague) await wallet.PromotOrDemote(userId, true);
             using var botScope = bots.Push(new BotRuntimeContext { Config = new BotInstanceConfig { Id = botId, Type = BotInstanceTypes.Owned } });
             await using var db = databases.Users.CreateDbContext();
             var campaign = await db.WalletChargeCampaigns.FindAsync(1);
             if (campaign == null) db.WalletChargeCampaigns.Add(campaign = new WalletChargeCampaign());
-            campaign.Enabled = true;
+            campaign.Enabled = enabled;
             campaign.Percent = 20;
             campaign.Name = "بلک‌فرایدی";
             await db.SaveChangesAsync();
@@ -69,7 +70,7 @@ public sealed partial class ConcurrencyTests
                 await using var read = databases.Users.CreateDbContext();
                 var saved = await read.WalletChargeBonuses.SingleAsync(x => x.Provider == provider && x.TelegramUserId == userId);
                 Assert.Equal(principal, saved.PrincipalToman);
-                Assert.Equal(20000, saved.BonusToman);
+                Assert.Equal(expectedGift, saved.BonusToman);
                 Assert.Null(saved.NextAttemptAtUtc);
                 var hash = gateway == PaymentGateway.UniquePay
                     ? (await read.UniquePayPaymentInfos.SingleAsync(x => x.TelegramUserId == userId)).HashId : "fixture";
@@ -137,8 +138,8 @@ public sealed partial class ConcurrencyTests
                     break;
             }
 
-            // A real provider's validated paid state is now persisted. Different live settings must not replace the promise.
-            campaign.Enabled = false;
+            // After official payment, current settings must neither remove an existing gift nor add one to a zero promise.
+            campaign.Enabled = !enabled;
             campaign.Percent = 15;
             campaign.Name = "کمپین بعدی";
             await db.SaveChangesAsync();
@@ -152,14 +153,22 @@ public sealed partial class ConcurrencyTests
             await Task.WhenAll(recovered.ReconcileAsync(), restarted.ReconcileAsync());
             await settle();
             await restarted.ReconcileAsync();
-            Assert.Equal(120000, await wallet.GetAccountBalance(userId));
+            Assert.Equal(principal + expectedGift, await wallet.GetAccountBalance(userId));
             var entries = await db.WalletLedgerEntries.AsNoTracking().Where(x => x.TelegramUserId == userId).ToListAsync();
             Assert.Equal(principal, Assert.Single(entries, x => x.Reason == WalletLedgerReasons.WalletCharge).AmountToman);
-            Assert.Equal(20000, Assert.Single(entries, x => x.Reason == WalletLedgerReasons.WalletChargeBonus).AmountToman);
             var notice = await db.PaymentSettlementNotifications.SingleAsync(x => x.TelegramUserId == userId);
-            Assert.Equal(120000, notice.AmountToman);
-            Assert.Contains("بلک‌فرایدی", notice.MessageText);
-            Assert.Contains("120,000", notice.MessageText);
+            Assert.Equal(principal + expectedGift, notice.AmountToman);
+            if (enabled)
+            {
+                Assert.Equal(expectedGift, Assert.Single(entries, x => x.Reason == WalletLedgerReasons.WalletChargeBonus).AmountToman);
+                Assert.Contains("بلک‌فرایدی", notice.MessageText);
+                Assert.Contains("120,000", notice.MessageText);
+            }
+            else
+            {
+                Assert.DoesNotContain(entries, x => x.Reason == WalletLedgerReasons.WalletChargeBonus);
+                Assert.DoesNotContain("بلک‌فرایدی", notice.MessageText);
+            }
         }
     }
 
@@ -168,18 +177,43 @@ public sealed partial class ConcurrencyTests
     public void WalletCampaign_Eligibility_rate_rounding_and_safe_preview()
     {
         const string charge = TenantBotPaymentPurposes.WalletCharge;
-        Assert.True(WalletChargeCampaignService.IsEligible(charge, "owned", "main", "main", false));
-        Assert.True(WalletChargeCampaignService.IsEligible(charge, "owned", "brand", "main", true));
-        Assert.False(WalletChargeCampaignService.IsEligible(charge, "owned", "brand", "main", false));
-        Assert.False(WalletChargeCampaignService.IsEligible(charge, "tenant", "main", "main", true));
+        var registry = new BotRegistry(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["bots:0:id"] = "main", ["bots:0:isDefault"] = "true", ["bots:1:id"] = "brand", ["bots:2:id"] = "store",
+            ["bots:2:type"] = BotInstanceTypes.Tenant
+        }).Build());
+        Assert.True(WalletChargeCampaignService.IsEligible(charge, "owned", "main", registry));
+        Assert.True(WalletChargeCampaignService.IsEligible(charge, "owned", "brand", registry));
+        Assert.False(WalletChargeCampaignService.IsEligible(charge, "tenant", "main", registry));
+        Assert.False(WalletChargeCampaignService.IsEligible(charge, "owned", "store", registry));
+        Assert.False(WalletChargeCampaignService.IsEligible(charge, "owned", "unknown", registry));
+        Assert.False(WalletChargeCampaignService.IsEligible(charge, "owned", " ", registry));
+        Assert.False(WalletChargeCampaignService.IsEligible(charge, "owned", "main", null!));
         foreach (var purpose in new[] { "purchase", "renew", "admin", "refund", "referral" })
-            Assert.False(WalletChargeCampaignService.IsEligible(purpose, "owned", "main", "main", true));
+            Assert.False(WalletChargeCampaignService.IsEligible(purpose, "owned", "main", registry));
         var settings = new WalletChargeCampaign { Name = "<هدیه>", Percent = 15 };
         Assert.Equal(0, WalletChargeCampaignService.Quote(settings, 100000).BonusToman);
         settings.Enabled = true;
         var captured = WalletChargeCampaignService.Quote(settings, 100001);
         Assert.Equal(15000, captured.BonusToman);
         Assert.Contains("&lt;", WalletChargeCampaignService.Describe(captured, html: true));
+    }
+
+    /// <summary>Admin reporting identifies the invoice and prints actual principal, gift and combined credit without exposing private identity.</summary>
+    [Fact]
+    public void WalletCampaign_Admin_credit_audit_uses_committed_amounts_and_escapes_labels()
+    {
+        var bonus = new WalletChargeBonus { Provider = "atlaspay", PaymentId = 42, BotId = "owned<&", Name = "<هدیه>", Percent = 20,
+            TelegramUserId = 123456789, PrincipalToman = 100000, BonusToman = 20000 };
+        var text = WalletChargeCampaignService.DescribeAdminCredit(bonus,
+            new WalletOperation { AmountToman = 100000 }, new WalletOperation { AmountToman = 20000, AfterBalance = 125000 });
+        Assert.Contains("atlaspay:42", text);
+        Assert.Contains("owned&lt;&amp;", text);
+        Assert.Contains("&lt;", text);
+        Assert.Contains("20٪", text);
+        foreach (var amount in new long[] { 100000, 20000, 120000, 125000 })
+            Assert.Contains(Adminbot.Utils.DateHelper.FormatCurrency(amount), text);
+        Assert.DoesNotContain("123456789", text);
     }
 
     /// <summary>Exercises principal-only provisional approval, later provider proof and restart after the gift ledger commit window.</summary>

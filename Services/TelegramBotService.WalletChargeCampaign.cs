@@ -118,7 +118,7 @@ public partial class TelegramBotService
         await _workflow.ReadAsync(async db => await db.WalletChargeCampaigns.FindAsync([1], token)) ?? new WalletChargeCampaign();
 
     /// <summary>Previews the current owned wallet offer before the customer confirms issuance.</summary>
-    /// <param name="user">Current Telegram customer's credentials profile; only its fresh role is relevant.</param>
+    /// <param name="user">Current Telegram customer's registered credentials profile; neither customer role is privileged.</param>
     /// <param name="principal">Proposed wallet credit in positive whole toman before fees.</param>
     /// <param name="token">Cancellation of the read-only settings lookup.</param>
     /// <returns>Optional safe Persian Telegram HTML, with an explicit preview versus issued-price distinction.</returns>
@@ -126,7 +126,7 @@ public partial class TelegramBotService
     {
         if (user == null || !WalletChargeCampaignService.IsEligible(TenantBotPaymentPurposes.WalletCharge,
                 CurrentBot?.Type ?? BotContextAccessor.CurrentBotType, CurrentBot?.Id ?? BotContextAccessor.CurrentBotId,
-                _botRegistry?.DefaultBot?.Id, user.IsColleague))
+                _botRegistry))
             return string.Empty;
         var preview = WalletChargeCampaignService.Describe(WalletChargeCampaignService.Quote(await ReadWalletChargeCampaignAsync(token), principal), html: true);
         return preview.Length == 0 ? preview : preview + "\nهدیه قطعی در فاکتور صادرشده نمایش داده می‌شود.";

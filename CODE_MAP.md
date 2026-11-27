@@ -1082,14 +1082,16 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
   target is missing stays pending for operator review. There is no distributed transaction between the two databases.
 - Wallet-charge campaign (#14): the owned private super-admin panel edits the global name, whole percent (1–100)
   and explicit on/off state. Defaults are disabled, بلک‌فرایدی, 20%. `WalletChargeApplicationService` freezes an
-  offer in users.db before provider POST for legitimate owned-platform wallet charges: direct customers of the
-  configured default bot and colleagues of any owned bot. Tenant charges and direct orders do not qualify. Gift
+  offer in users.db before provider POST for wallet charges from **any exact registered owned bot**, regardless of
+  payer role (#15). Tenant charges, unknown origins and direct orders do not qualify. Gift
   is floor(principal × percent / 100); fees, gateway admission and referral base are unchanged.
 - `WalletChargeCampaignService` stages a due promise with the verified principal marker, or with subsequent
   official confirmation of a provisional credit. The local reconciliation worker verifies the exact principal receipt
   and issues the separate `wallet-charge-bonus:{provider}:{id}` credit/ledger entry once. Combined receipt uses
   the gift operation's persisted after-balance; outbox delivery never mutates wallets. Partial/provisional-only
-  credits cannot authorize a gift. Migration only adds settings, promises, and the due index; there is no backfill.
+  credits cannot authorize a gift. The completion winner emits a private financial audit with the actual principal,
+  gift, total and after-balance. Historical snapshots are never rewritten; see
+  [the read-only audit and remediation runbook](docs/wallet-charge-campaign-remediation.md).
 
 ## XUI Creation Reservations
 

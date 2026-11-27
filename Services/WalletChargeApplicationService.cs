@@ -12,8 +12,8 @@ using Microsoft.EntityFrameworkCore;
 /// <param name="unique">Existing UniquePay transport.</param>
 /// <param name="atlas">Existing AtlasPay transport.</param>
 /// <param name="now">Existing NOWPayments transport.</param>
-/// <param name="credentials">Global role reader used only when freezing an owned issuance offer.</param>
-/// <param name="registry">Registry containing the exact default owned origin; absent in isolated legacy callers.</param>
+/// <param name="credentials">Global wallet profile reader used only to verify the private owned charge target.</param>
+/// <param name="registry">Registry used to verify the exact owned origin; absent in isolated legacy callers.</param>
 /// <remarks>Provider settlement, wallet receipts, referrals and delivery stay in existing services. Personal storefront cards are never funding providers.
 /// Tenant creation rechecks stored approval and owner funding before POST; insufficient funding ignores saved provider opt-outs.
 /// Owned creation freezes any campaign promise before POST, independently of fees, without increasing the provider amount.</remarks>
@@ -135,14 +135,14 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of the local reads and atomic snapshot write.</param>
     /// <returns>A task completing before calling the provider, even if the frozen offer is zero.</returns>
     /// <remarks>No balance changes occur. Campaign settings and issuance are serialized in users.db; existing promises
-    /// never change. This does not authorize retry of a provider mutation or change the amount sent to the provider.</remarks>
+    /// never change. All registered owned bots use the same policy regardless of payer role. This does not authorize
+    /// retry of a provider mutation or change the amount sent to the provider.</remarks>
     private async Task FreezeCampaignAsync(string provider, int id, string purpose, string botId, string botType,
         long userId, long chatId, long amount, CancellationToken token)
     {
-        if (botType != BotInstanceTypes.Owned || credentials == null || registry?.DefaultBot == null) return;
+        if (credentials == null || !WalletChargeCampaignService.IsEligible(purpose, botType, botId, registry)) return;
         var user = await credentials.GetUserStatusWithId(userId);
-        var eligible = user != null && chatId == userId &&
-            WalletChargeCampaignService.IsEligible(purpose, botType, botId, registry.DefaultBot.Id, user.IsColleague);
+        var eligible = user != null && chatId == userId;
         await workflow.WriteAsync(async db =>
         {
             await using var transaction = await db.Database.BeginTransactionAsync(token);

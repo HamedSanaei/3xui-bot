@@ -1,5 +1,6 @@
 using System.Net;
 using Adminbot.Domain;
+using Adminbot.Domain.Logging;
 using Adminbot.Utils;
 using Microsoft.EntityFrameworkCore;
 
@@ -9,17 +10,18 @@ internal static class WalletChargeCampaignService
     /// <summary>Stable credentials.db and ledger key namespace reserved for campaign credits.</summary>
     internal const string BonusOperationPrefix = "wallet-charge-bonus:";
 
-    /// <summary>Identifies the single platform wallet audience, independently of Telegram conversation state.</summary>
+    /// <summary>Recognizes a platform wallet charge from any registered owned bot, regardless of customer role.</summary>
     /// <param name="purpose">Immutable purpose from a persisted provider payment; only wallet_charge qualifies.</param>
     /// <param name="botType">Persisted origin family; only owned qualifies.</param>
-    /// <param name="botId">Internal originating bot id.</param>
-    /// <param name="defaultBotId">Exact configured main owned bot id, not a fallback lookup.</param>
-    /// <param name="isColleague">Fresh global credentials role at issuance.</param>
-    /// <returns>True for the main owned bot or an owned-bot colleague, only for wallet charges.</returns>
-    internal static bool IsEligible(string purpose, string botType, string botId, string defaultBotId, bool isColleague) =>
+    /// <param name="botId">Nonempty immutable internal origin id, never a Telegram-supplied bot name.</param>
+    /// <param name="registry">Current bot registry; absent or unknown origins fail closed.</param>
+    /// <returns>True only for wallet charges with a matching owned registration; tenant and default fallback are rejected.</returns>
+    /// <remarks>Use for previews and new invoice snapshots, never to re-evaluate an issued promise during settlement.</remarks>
+    internal static bool IsEligible(string purpose, string botType, string botId, BotRegistry registry) =>
         purpose == TenantBotPaymentPurposes.WalletCharge && botType == BotInstanceTypes.Owned &&
         !string.IsNullOrWhiteSpace(botId) &&
-        (isColleague || string.Equals(botId, defaultBotId, StringComparison.Ordinal));
+        registry?.GetById(botId) is { Type: BotInstanceTypes.Owned } origin &&
+        string.Equals(origin.Id, botId, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Reads a campaign offer without freezing an invoice or giving credit.</summary>
     /// <param name="settings">Global users.db settings; a missing row is equivalent to a paused campaign.</param>
@@ -128,15 +130,32 @@ internal static class WalletChargeCampaignService
         receipt.TelegramUserId == bonus.TelegramUserId && receipt.AmountToman == bonus.PrincipalToman &&
         receipt.ApprovalKind == (confirmedProvisional ? "provisional" : "official");
 
+    /// <summary>Builds an administrator payment audit from the original and committed gift receipts.</summary>
+    /// <param name="bonus">Validated invoice snapshot identifying the internal provider payment and frozen campaign.</param>
+    /// <param name="principal">Matching committed receipt with the original wallet principal in whole toman.</param>
+    /// <param name="gift">Matching committed receipt with the credited gift and actual post-credit wallet balance in toman.</param>
+    /// <returns>Telegram HTML for the private logger channel; contains no customer identifiers, invoice URLs or provider credentials.</returns>
+    /// <remarks>Call only after wallet, ledger, and completion are durable. The total is actual credit, not a promotional quote or gateway gross.</remarks>
+    internal static string DescribeAdminCredit(WalletChargeBonus bonus, WalletOperation principal, WalletOperation gift) =>
+        "✅ <b>هدیه شارژ کیف پول ثبت شد</b>\n\n" +
+        $"🤖 ربات مبدأ: <code>{WebUtility.HtmlEncode(bonus.BotId)}</code>\n" +
+        $"🧾 شناسه پرداخت: <code>{WebUtility.HtmlEncode(bonus.Provider)}:{bonus.PaymentId}</code>\n" +
+        $"🎁 کمپین: {WebUtility.HtmlEncode(bonus.Name)} ({bonus.Percent}٪)\n" +
+        $"💳 اصل شارژ: <code>{principal.AmountToman.FormatCurrency()}</code>\n" +
+        $"🎁 هدیه ثبت‌شده: <code>{gift.AmountToman.FormatCurrency()}</code>\n" +
+        $"💰 جمع اعتبار ثبت‌شده: <code>{checked(principal.AmountToman + gift.AmountToman).FormatCurrency()}</code>\n" +
+        $"💳 موجودی پس از هدیه: <code>{gift.AfterBalance.FormatCurrency()}</code>";
+
     /// <summary>Recovers one bounded batch of verified bonus credits and their ledger and combined outbox receipts.</summary>
     /// <param name="users">users.db factory for due promises, their completion and delivery outbox.</param>
     /// <param name="credentials">Global wallet database factory for original and bonus receipts.</param>
     /// <param name="ledger">Idempotent users.db ledger service; uses the same named credential receipt.</param>
-    /// <param name="logger">Operational diagnostics; no user, campaign text or payment payload is logged.</param>
+    /// <param name="logger">Private operational and financial logger; no user identifiers or provider payload are logged.</param>
     /// <param name="token">Worker cancellation during local database operations only.</param>
     /// <returns>Number of due promises durably completed, including recovery after a previous wallet commit.</returns>
-    /// <remarks>No provider or Telegram I/O. The principal is never replayed. A named positive credit in credentials.db
-    /// precedes the users.db ledger/outbox; retry reuses the same receipt and cannot increase the wallet twice.</remarks>
+    /// <remarks>No provider or direct Telegram I/O. The principal is never replayed. A named positive credit in credentials.db
+    /// precedes the users.db ledger/outbox; retry cannot increase the wallet twice. Only the completion winner emits
+    /// the best-effort financial audit. Logging never gates credit, the ledger, or the customer's durable receipt.</remarks>
     internal static async Task<int> ReconcileAsync(UserDbContextFactory users, CredentialsDbContextFactory credentials,
         WalletLedgerService ledger, ILogger logger, CancellationToken token)
     {
@@ -175,7 +194,7 @@ internal static class WalletChargeCampaignService
                 }
 
                 // Commit completion and delivery together; a second worker sees completion even after a process restart.
-                completed += await SqliteOperation.RunAsync(async ct =>
+                var finalized = await SqliteOperation.RunAsync(async ct =>
                 {
                     await using var db = users.CreateDbContext();
                     await using var transaction = await db.Database.BeginTransactionAsync(ct);
@@ -192,11 +211,14 @@ internal static class WalletChargeCampaignService
                     await transaction.CommitAsync(ct);
                     return 1;
                 }, token);
+                completed += finalized;
+                if (finalized == 1)
+                    logger.LogPayment(DescribeAdminCredit(bonus, principal, gift));
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                logger.LogWarning("Wallet campaign bonus remains pending. Provider={Provider} PaymentId={PaymentId} ErrorType={ErrorType}",
+                logger.LogWarning("Wallet campaign bonus recovery requires retry; verify the ledger before any manual credit. Provider={Provider} PaymentId={PaymentId} ErrorType={ErrorType}",
                     bonus.Provider, bonus.PaymentId, ex.GetType().Name);
                 await using var db = users.CreateDbContext();
                 var retryAt = DateTime.UtcNow.AddMinutes(5);
