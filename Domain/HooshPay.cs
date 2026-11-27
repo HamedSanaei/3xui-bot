@@ -446,8 +446,8 @@ namespace Adminbot.Domain
         /// Official and provisional wallet settlement share one payment-keyed gate so concurrent IPN and super-admin
         /// work cannot credit the same invoice twice. When a prior provisional credit exists, this method returns
         /// <c>AlreadyAdded</c>; official reconciliation is recorded separately before this method is called. The first
-        /// credit enqueues one notification in the same users.db save as <c>IsAddedToBalance</c>; Telegram delivery is
-        /// performed later and can never re-enter this method.
+        /// credit enqueues one notification or stages its exact campaign promise with <c>IsAddedToBalance</c>.
+        /// The separate bonus credit uses the official receipt; Telegram delivery can never re-enter settlement.
         /// The single customer notice includes the committed receipt balance and explains that funding alone does
         /// not activate an account; owned and admitted tenant wallets still require a later purchase or renewal.
         /// </remarks>
@@ -513,7 +513,7 @@ namespace Adminbot.Domain
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; the delivery-only worker cannot re-enter settlement.
                 var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
-                _workflow.Add(
+                await WalletChargeCampaignService.StageOfficialCreditAsync(_workflow,
                     PaymentSettlementNotification.CreateWalletCredit(
                         provider: "hooshpay",
                         providerPaymentId: payment.Id,
@@ -523,7 +523,7 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
                         createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
-                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId), walletReceipt, cancellationToken);
                 await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(
@@ -773,8 +773,8 @@ namespace Adminbot.Domain
         /// row was not provisional, was not yet provider-paid, or had already been reconciled.
         /// </returns>
         /// <remarks>
-        /// No wallet or ledger mutation occurs here. The method exists solely to prove that a super-admin's temporary
-        /// financial exception was later confirmed by HooshPay.
+        /// No wallet or ledger mutation occurs here. The method records HooshPay's official proof and stages any
+        /// positive invoice-time campaign promise for the independent wallet reconciliation worker.
         /// </remarks>
         public async Task<bool> RecordProviderConfirmationAfterProvisionalAsync(
             HooshPayPaymentInfo payment,
@@ -801,6 +801,8 @@ namespace Adminbot.Domain
                     return false;
 
                 payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+                await WalletChargeCampaignService.StageProvisionalConfirmationAsync(_workflow, _credentialsDbContext,
+                    "hooshpay", payment.Id, payment.BotId, cancellationToken);
                 payment.UpdatedAtUtc = DateTime.UtcNow;
                 await _workflow.SaveAsync(cancellationToken);
 

@@ -137,6 +137,7 @@ public partial class TelegramBotService
         AdminWeeklyUsageAction,
         AdminMonthlyUsageAction,
         AdminPaymentGatewayAction,
+        AdminWalletChargeCampaignAction,
         AdminSalesControlAction,
         AdminChannelPostAction,
         TenantBotService.TenantWalletAdminMenuAction,
@@ -410,6 +411,7 @@ public partial class TelegramBotService
     /// so support, activity attribution, and Telegram delivery remain scoped to the active owned or tenant bot.
     /// Public-channel composition and publication are delegated to the shared manager using the explicit source bot
     /// and sender/private-chat identity; this scoped service never performs target probes or media downloads.
+    /// The owned charge service uses the registered default bot and shared credentials role to freeze campaign offers.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The required public-channel manager or trial logging settings dependency is null.</exception>
     /// <example><code>var handler = scope.ServiceProvider.GetRequiredService&lt;TelegramBotService&gt;();</code></example>
@@ -468,7 +470,7 @@ public partial class TelegramBotService
         _configuration = configuration;
         _appConfig = _configuration.Get<AppConfig>();
         _walletCharges = new WalletChargeApplicationService(dbContext, _appConfig, gatewayAvailability, null, null,
-            hooshPay, tetraminator, uniquePay, atlasPay, nowPayments);
+            hooshPay, tetraminator, uniquePay, atlasPay, nowPayments, credentialsDb, botRegistry);
         _logger = logger;
         _broadcastManager = broadcastManager;
         _nowPayments = nowPayments;
@@ -939,6 +941,7 @@ public partial class TelegramBotService
     /// on every callback; second confirmations enter the existing tenant order gate, never the renewal settlement path.
     /// Global sale/renewal controls are owned-only, super-admin-authorized high-priority navigation. Closing a
     /// category blocks fresh customer admission across all bots, not the settlement of accepted paid/started work.
+    /// The private owned super-admin campaign editor runs before customer flow dispatch and affects only new charge invoices.
     /// Owned phone settings are routed before customer state. Super-admin access and recognized payment-return commands
     /// remain independent of the customer entry prompt, and tenant and assistant routing retain their own rules.
     /// Owned super-admin channel-post callbacks and text/photo intake delegate to the bounded shared manager after
@@ -1202,6 +1205,8 @@ public partial class TelegramBotService
         // The same precedence applies to "📑 Menu": while the super-admin panel is open it must abandon any stale
         // admin sub-flow and return to the owned-bot main menu without touching super-admin authorization.
         if (isOwnedBot && await TryHandleSuperAdminMenuExitAsync(botClient, message, cancellationToken))
+            return;
+        if (isOwnedBot && await TryHandleWalletChargeCampaignAdminAsync(botClient, message, cancellationToken))
             return;
         if (_provisionalManualReview != null && await _provisionalManualReview.TryHandleMessageAsync(botClient, message, cancellationToken))
             return;
@@ -6148,6 +6153,8 @@ public partial class TelegramBotService
     /// Trial entry displays «اکانت تست» while accepting the previous free-account button as an input alias.
     /// Active colleagues share the configured Tehran-day free-test quota across owned bots and can explicitly buy
     /// the same test at colleague rates after exhausting it.
+    /// Owned wallet charge previews show the current campaign, while issued payment links show the saved invoice
+    /// promise. Neither text changes the gateway amount or authorizes credit.
     /// Account management contains miscellaneous tutorials, then installation guidance with Android/iOS/Windows
     /// image choices. These navigation actions run before purchase/APN text handling and preserve that bot/user state.
     /// </remarks>
@@ -6986,7 +6993,9 @@ public partial class TelegramBotService
                         payment.BaseCurrency = nowPayment.price_currency;
                         await _workflow.SaveAsync();
 
-                        var msg = await GetNowPaymentsPaymentMessage(credUser, payment);
+                        var msg = await AppendIssuedWalletChargeBonusAsync(botClient, message.Chat.Id,
+                            await GetNowPaymentsPaymentMessage(credUser, payment), "nowpayments", payment.Id,
+                            !string.IsNullOrWhiteSpace(nowPayment.invoice_url), cancellationToken);
                         var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
                         {
                             new[]
@@ -7292,7 +7301,8 @@ public partial class TelegramBotService
 
             var text = $"✅ شما مقدار {Convert.ToInt64(user.ConfigLink).FormatCurrency()} را برای شارژ حساب خود وارد کرده‌اید.\n" +
                        $"درگاه انتخابی: {gatewayName}\n" +
-                       "برای ادامه، گزینه تایید نهایی را بزنید. در غیر این صورت انصراف را انتخاب کنید.";
+                       "برای ادامه، گزینه تایید نهایی را بزنید. در غیر این صورت انصراف را انتخاب کنید." +
+                       await DescribeWalletChargePreviewAsync(credUser, Convert.ToInt64(user.ConfigLink), cancellationToken);
             await botClient.CustomSendTextMessageAsync(
                 chatId: message.Chat.Id,
                 text: text,
@@ -7335,7 +7345,8 @@ public partial class TelegramBotService
                     text: $"✅ مبلغ <b>{longValue.FormatCurrency()}</b> برای شارژ کیف پول ثبت شد.\n\n" +
                           "⚡ درگاه‌های فعال پرداخت موفق را به‌صورت خودکار و فوری تایید می‌کنند.\n" +
                           BuildActiveChargeGatewaySummary() + "\n\n" +
-                          "👇 درگاه موردنظر را انتخاب کنید.",
+                          "👇 درگاه موردنظر را انتخاب کنید." +
+                          await DescribeWalletChargePreviewAsync(credUser, longValue, cancellationToken),
                     parseMode: ParseMode.Html,
                     replyMarkup: paymentmethod);
                 return;
@@ -9231,6 +9242,7 @@ public partial class TelegramBotService
     /// The global switch and HooshPay's inclusive 50,000 through 1,000,000 toman range are checked before creating a
     /// local payment row or calling the provider. Invalid persisted or crafted state returns to payment-method
     /// selection without provider contact. Disabling new invoices does not affect existing inquiry or settlement.
+    /// The payment message shows only the campaign promise frozen before the non-retried provider request.
     /// </remarks>
     /// <returns>A task completing after invoice creation and its payment link, or a validation/provider failure reply.</returns>
     private async Task CreateHooshPayWalletChargeAsync(
@@ -9298,7 +9310,9 @@ public partial class TelegramBotService
             payment.Apply(invoice.data);
             await _workflow.SaveAsync(cancellationToken);
 
-            var msg = await GetHooshPayPaymentMessage(credUser, payment);
+            var msg = await AppendIssuedWalletChargeBonusAsync(ActiveBotClient, message.Chat.Id,
+                await GetHooshPayPaymentMessage(credUser, payment), "hooshpay", payment.Id,
+                !string.IsNullOrWhiteSpace(payment.PaymentUrl), cancellationToken);
             var inlineKeyboardMarkup = new InlineKeyboardMarkup(new[]
             {
                 new[]
@@ -9398,6 +9412,14 @@ public partial class TelegramBotService
         }
     }
 
+    /// <summary>Issues an owned AtlasPay wallet invoice and shows the saved campaign inside the payment instructions.</summary>
+    /// <param name="message">Current owned-bot customer message; its Telegram chat receives the invoice controls.</param>
+    /// <param name="credUser">Authenticated global wallet owner; the immutable Telegram user id is saved on the payment.</param>
+    /// <param name="user">Owned conversation state containing the positive base charge in whole toman before fees.</param>
+    /// <param name="cancellationToken">Cancellation of local persistence, the non-retried create request and Telegram delivery.</param>
+    /// <returns>A task completing after the invoice or a validation/creation failure is shown.</returns>
+    /// <remarks>The saved campaign bonus does not change the provider base charge or authorize another POST.
+    /// Official settlement, the ledger, and bonus recovery occur separately.</remarks>
     private async Task CreateAtlasPayWalletChargeAsync(Message message, CredUser credUser, User user, CancellationToken cancellationToken)
     {
         if (!_gatewayAvailability.Snapshot.IsEnabled(PaymentGateway.AtlasPay))
@@ -9446,6 +9468,7 @@ public partial class TelegramBotService
                 payment.CustomerStartLink,
                 $"apchk_{payment.Id}",
                 directPayment != null);
+            text = await AppendIssuedWalletChargeBonusAsync(ActiveBotClient, message.Chat.Id, text, "atlaspay", payment.Id, false, cancellationToken);
             var sent = await ActiveBotClient.SendMessage(message.Chat.Id, text, parseMode: ParseMode.Html,
                 replyMarkup: keyboard, cancellationToken: cancellationToken);
             payment.TelMsgId = sent.MessageId;
@@ -9560,6 +9583,7 @@ public partial class TelegramBotService
     /// invoice-specific unsigned callback and browser return only
     /// trigger authoritative inquiry. The displayed 12% is the gateway fee; UniquePay decides whether the
     /// <c>user</c>/<c>buyer</c> or owner bears it, while only the immutable local base amount can be credited.
+    /// A campaign promise is displayed separately; fees do not contribute to its calculation.
     /// </remarks>
     /// <returns>A task completing after durable invoice preparation and the non-retried provider request and customer response.</returns>
     private async Task CreateUniquePayWalletChargeAsync(
@@ -9634,6 +9658,7 @@ public partial class TelegramBotService
                        "💳 مبلغ نهایی مطابق تنظیمات کارمزد، در صفحه رسمی یونیک‌پی نمایش داده می‌شود.\n" +
                        $"🧾 شناسه فاکتور: <code>{Html(payment.RefId)}</code>\n\n" +
                        "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از استعلام رسمی یونیک‌پی انجام می‌شود.";
+            text = await AppendIssuedWalletChargeBonusAsync(ActiveBotClient, message.Chat.Id, text, "uniquepay", payment.Id, false, cancellationToken);
             var keyboard = new InlineKeyboardMarkup(new[]
             {
                 new[] { InlineKeyboardButton.WithUrl("پرداخت با یونیک‌پی | ریالی", payment.PaymentLink) },
@@ -9824,6 +9849,7 @@ public partial class TelegramBotService
     /// confirmation state is cleared before the provider request so tapping the old reply-keyboard command again does
     /// not create another invoice from the same owned-bot charge flow.
     /// Both saved routes are shown in bot-then-online order, with guidance to pay through only one route.
+    /// Both routes share the same immutable charge campaign promise displayed before payment.
     /// </remarks>
     /// <returns>A task completing after durable invoice preparation, provider creation, and the customer response.</returns>
     private async Task CreateTetraminatorWalletChargeAsync(
@@ -9876,6 +9902,7 @@ public partial class TelegramBotService
                        $"💰 مبلغ: <code>{Html(amount.FormatCurrency())}</code>\n" +
                        $"🧾 شناسه پرداخت: <code>{Html(payment.PayId)}</code>\n\n" +
                        "پس از پرداخت، دکمه بررسی وضعیت را بزنید. شارژ فقط بعد از تایید رسمی درگاه انجام می‌شود.\n\n" + TetraminatorCustomerPaymentUi.Guidance;
+            text = await AppendIssuedWalletChargeBonusAsync(ActiveBotClient, message.Chat.Id, text, "tetraminator", payment.Id, false, cancellationToken);
             var keyboard = TetraminatorCustomerPaymentUi.BuildKeyboard(payment.PaymentLink, payment.GatewayLink, $"tmchk_{payment.Id}");
             var sent = await ActiveBotClient.SendMessage(
                 message.Chat.Id,

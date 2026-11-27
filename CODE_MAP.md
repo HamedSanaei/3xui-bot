@@ -1077,10 +1077,21 @@ provider-oriented external I/O (60 s per-attempt timeout x retry budget) and an 
 - `users.db` ledger (`WalletLedgerService.RecordAsync`) is written after the credentials commit, keyed by the same
   operation key. A crash between the two commits is repaired by `WalletOperationReconciliationService`: it reads
   committed-but-unreconciled receipts older than one minute, writes the missing users.db ledger entry idempotently,
-  completes payment/referral metadata, and only then marks `ReconciledAtUtc`. It never changes balances, never calls
-  providers, and never infers history from current balances. A receipt whose payment target is missing stays pending
-  for operator review (never falsely reconciled). There is deliberately NO distributed transaction between the two
-  databases.## XUI Creation Reservations
+  completes payment/referral metadata, and only then marks `ReconciledAtUtc`. Repair of existing receipts never
+  replays their balance changes, calls providers, or infers history from current balances. A receipt whose payment
+  target is missing stays pending for operator review. There is no distributed transaction between the two databases.
+- Wallet-charge campaign (#14): the owned private super-admin panel edits the global name, whole percent (1–100)
+  and explicit on/off state. Defaults are disabled, بلک‌فرایدی, 20%. `WalletChargeApplicationService` freezes an
+  offer in users.db before provider POST for legitimate owned-platform wallet charges: direct customers of the
+  configured default bot and colleagues of any owned bot. Tenant charges and direct orders do not qualify. Gift
+  is floor(principal × percent / 100); fees, gateway admission and referral base are unchanged.
+- `WalletChargeCampaignService` stages a due promise with the verified principal marker, or with subsequent
+  official confirmation of a provisional credit. The local reconciliation worker verifies the exact principal receipt
+  and issues the separate `wallet-charge-bonus:{provider}:{id}` credit/ledger entry once. Combined receipt uses
+  the gift operation's persisted after-balance; outbox delivery never mutates wallets. Partial/provisional-only
+  credits cannot authorize a gift. Migration only adds settings, promises, and the due index; there is no backfill.
+
+## XUI Creation Reservations
 
 - `Services/XuiV3CreationOperationStore.cs` + `Domain/XuiV3CreationOperation.cs`: before the non-idempotent XUI
   `addClient` POST, the first caller persists a stable client identity and requested plan parameters in users.db

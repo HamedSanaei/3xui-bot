@@ -478,8 +478,9 @@ public sealed class TetraminatorSettlementService
     /// <param name="cancellationToken">Cancellation token for wallet, users.db, ledger, referral, and outbox work.</param>
     /// <returns>Applied, AlreadyAdded, ProviderNotPaid, UserNotFound, or NotFound.</returns>
     /// <remarks>
-    /// The first wallet credit and unique notification row share one users.db save. Telegram delivery runs later and
-    /// cannot repeat this settlement path.
+    /// The first wallet credit marker shares one users.db save with its unique notification or matched campaign promise.
+    /// Official confirmation can stage a bonus for a provisionally credited principal; it cannot credit principal again.
+    /// The delivery worker runs later and cannot enter this financial path.
     /// The one combined customer confirmation includes the committed wallet receipt balance and explains that credit
     /// can buy or renew an account; funding alone does not activate it or change its status.
     /// </remarks>
@@ -521,6 +522,8 @@ public sealed class TetraminatorSettlementService
                     if (!payment.ProviderConfirmedAfterProvisionalAtUtc.HasValue)
                     {
                         payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+                        await WalletChargeCampaignService.StageProvisionalConfirmationAsync(_workflow, _credentialsDbContext,
+                            "tetraminator", payment.Id, payment.BotId, cancellationToken);
                         payment.UpdatedAtUtc = DateTime.UtcNow;
                         await _workflow.SaveAsync(cancellationToken);
                         LogOfficialConfirmationAfterProvisional(payment, user, source);
@@ -552,7 +555,7 @@ public sealed class TetraminatorSettlementService
             payment.UpdatedAtUtc = DateTime.UtcNow;
             // Persist the notification with the first-credit marker before ledger/referral follow-up work.
             var notificationChatId = notifyChatId ?? (payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : user.ChatID);
-            _workflow.Add(
+            await WalletChargeCampaignService.StageOfficialCreditAsync(_workflow,
                 PaymentSettlementNotification.CreateWalletCredit(
                     provider: "tetraminator",
                     providerPaymentId: payment.Id,
@@ -562,7 +565,7 @@ public sealed class TetraminatorSettlementService
                     amountToman: payment.AmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
                     createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: after,
-                    walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
+                    walletOriginTelegramBotId: payment.WalletOriginTelegramBotId), walletReceipt, cancellationToken);
             await _workflow.SaveAsync(cancellationToken);
             await EnsureOfficialLedgerAsync(payment, before, after, cancellationToken);
             await ProcessReferralAsync(payment, cancellationToken);

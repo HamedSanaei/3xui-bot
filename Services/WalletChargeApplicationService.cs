@@ -12,11 +12,14 @@ using Microsoft.EntityFrameworkCore;
 /// <param name="unique">Existing UniquePay transport.</param>
 /// <param name="atlas">Existing AtlasPay transport.</param>
 /// <param name="now">Existing NOWPayments transport.</param>
+/// <param name="credentials">Global role reader used only when freezing an owned issuance offer.</param>
+/// <param name="registry">Registry containing the exact default owned origin; absent in isolated legacy callers.</param>
 /// <remarks>Provider settlement, wallet receipts, referrals and delivery stay in existing services. Personal storefront cards are never funding providers.
-/// Tenant first creation rechecks stored approval and owner funding immediately before provider POST; insufficient funding ignores saved provider opt-outs.</remarks>
+/// Tenant creation rechecks stored approval and owner funding before POST; insufficient funding ignores saved provider opt-outs.
+/// Owned creation freezes any campaign promise before POST, independently of fees, without increasing the provider amount.</remarks>
 public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, AppConfig config,
     IPaymentGatewayAvailability availability, TenantCustomerWalletPolicy policy, TenantAccessService fundingAccess, HooshPay hoosh,
-    Tetraminator tetra, UniquePay unique, AtlasPay atlas, NowPayments now)
+    Tetraminator tetra, UniquePay unique, AtlasPay atlas, NowPayments now, CredentialsStore credentials = null, BotRegistry registry = null)
 {
     /// <summary>Customer-safe invoice delivery data; raw provider responses and API credentials are never exposed.</summary>
     /// <param name="Url">Provider-issued payment link, intended only for its paying customer.</param>
@@ -32,13 +35,16 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of admission revalidation and the non-retried provider call.</param>
     /// <returns>Provider creation result for the caller to apply and persist before Telegram delivery.</returns>
     /// <remarks>No provider request runs inside a database transaction. Tenant origins freshly recheck exact-owner funding;
-    /// debt mode ignores saved provider opt-outs. Failures never authorize another create or gate issued-invoice settlement.</remarks>
+    /// debt mode ignores saved provider opt-outs. Owned issuance freezes the campaign against the saved base amount.
+    /// Failures never authorize another create or gate issued-invoice settlement.</remarks>
     /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
     /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
     /// <example><code>payment.Apply((await charges.CreateHooshPayAsync(payment, token))?.data);</code></example>
     public async Task<HooshPayCreateInvoiceResponse> CreateHooshPayAsync(HooshPayPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.HooshPay, payment.AmountToman, token);
+        await FreezeCampaignAsync("hooshpay", payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType,
+            payment.TelegramUserId, payment.ChatId, payment.AmountToman, token);
         return await hoosh.CreateInvoiceAsync(payment.AmountToman, payment.OrderId, $"Wallet charge {payment.OrderId}", payment.IpnCallbackUrl, payment.ReturnUrl, token);
     }
 
@@ -47,13 +53,15 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of revalidation and provider I/O.</param>
     /// <returns>The provider result to persist; not proof of payment.</returns>
     /// <remarks>Tenant first POST freshly classifies exact-owner funding without wallet mutation; underfunding ignores opt-outs.
-    /// Automatic retry remains forbidden after any ambiguous provider result; existing invoice settlement is unchanged.</remarks>
+    /// Owned issuance freezes the campaign against the saved base amount. Automatic retry is forbidden after any ambiguous result.</remarks>
     /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
     /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
     /// <example><code>payment.Apply(await charges.CreateTetraminatorAsync(payment, token));</code></example>
     public async Task<TetraminatorCreateInvoiceResponse> CreateTetraminatorAsync(TetraminatorPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.Tetraminator, payment.AmountToman, token);
+        await FreezeCampaignAsync("tetraminator", payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType,
+            payment.TelegramUserId, payment.ChatId, payment.AmountToman, token);
         return await tetra.CreateInvoiceAsync(payment.AmountToman, payment.CallbackUrl, token);
     }
 
@@ -64,13 +72,15 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of revalidation and provider I/O.</param>
     /// <returns>Provider invoice metadata to persist before displaying its link.</returns>
     /// <remarks>The row must be committed first. Tenant funding is freshly checked immediately before POST; insufficient funding ignores opt-outs.
-    /// External creation stays outside write transactions and is never automatically retried. Issued invoices retain recovery.</remarks>
+    /// An owned offer is frozen against the base amount before HTTP. External creation stays outside write transactions and is never automatically retried.</remarks>
     /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
     /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
     /// <example><code>payment.Apply(await charges.CreateUniquePayAsync(payment, returnUrl, callbackUrl, token));</code></example>
     public async Task<UniquePayCreateInvoiceResponse> CreateUniquePayAsync(UniquePayPaymentInfo payment, string returnUrl, string callbackUrl, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.UniquePay, payment.BaseAmountToman, token);
+        await FreezeCampaignAsync("uniquepay", payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType,
+            payment.TelegramUserId, payment.ChatId, payment.BaseAmountToman, token);
         return await unique.CreateInvoiceAsync(payment.HashId, payment.BaseAmountToman, returnUrl, callbackUrl, token);
     }
 
@@ -79,13 +89,16 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of revalidation and non-retried creation.</param>
     /// <returns>Provider invoice metadata; settlement still requires official inquiry.</returns>
     /// <remarks>Tenant first POST freshly evaluates the exact owner's funding, overriding saved provider opt-outs only during underfunding.
-    /// The caller records failure/ambiguity on the existing attempt; no exception or Telegram retry authorizes another create.</remarks>
+    /// Owned issuance freezes the campaign against the base amount rather than the provider's gross. The caller records failure
+    /// on the existing attempt; no exception or Telegram retry authorizes another create.</remarks>
     /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
     /// <exception cref="OperationCanceledException">The caller cancels admission or provider I/O.</exception>
     /// <example><code>var invoice = await charges.CreateAtlasPayAsync(payment, token);</code></example>
     public async Task<AtlasPayCreateOrderResponse> CreateAtlasPayAsync(AtlasPayPaymentInfo payment, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.AtlasPay, payment.BaseAmountToman, token);
+        await FreezeCampaignAsync("atlaspay", payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType,
+            payment.TelegramUserId, payment.ChatId, payment.BaseAmountToman, token);
         return await atlas.CreateOrderAsync(payment.MerchantOrderRef, payment.BaseAmountToman, payment.TelegramUserId, token);
     }
 
@@ -97,14 +110,55 @@ public sealed class WalletChargeApplicationService(UserWorkflowStore workflow, A
     /// <param name="token">Cancellation of revalidation, canonical rate read and non-retried provider request.</param>
     /// <returns>Invoice data, including the canonical rate evidence for persistence by the caller.</returns>
     /// <remarks>Tenant first POST freshly evaluates exact-owner funding; underfunding ignores saved provider opt-outs.
-    /// The canonical toman conversion, non-retried transport and issued-invoice settlement remain unchanged; creation is outside SQLite transactions.</remarks>
+    /// Owned issuance freezes the campaign against the saved toman principal, before the canonical conversion. Transport is non-retried
+    /// and external creation occurs outside SQLite transactions.</remarks>
     /// <exception cref="InvalidOperationException">Saved intent, live gateway, amount, tenant approval or owner funding admission is invalid.</exception>
     /// <exception cref="OperationCanceledException">The caller cancels admission, canonical rate lookup or provider I/O.</exception>
     /// <example><code>var invoice = await charges.CreateNowPaymentsAsync(payment, currency, successUrl, cancelUrl, token);</code></example>
     public async Task<NowPaymentsInvoiceResponse> CreateNowPaymentsAsync(SwapinoPaymentInfo payment, string currency, string successUrl, string cancelUrl, CancellationToken token)
     {
         await ValidateCreationAsync(payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType, PaymentGateway.NowPayments, payment.AmountToman, token);
+        await FreezeCampaignAsync("nowpayments", payment.Id, payment.PaymentPurpose, payment.BotId, payment.WalletOriginBotType,
+            payment.TelegramUserId, payment.ChatId, payment.AmountToman, token);
         return await now.CreateInvoiceAsync(payment.AmountToman, payment.OrderId, $"Wallet charge {payment.OrderId}", null, currency, successUrl, cancelUrl, token);
+    }
+
+    /// <summary>Freezes the platform wallet offer after admission and before the first provider request.</summary>
+    /// <param name="provider">Canonical provider key matching ledger and settlement operation keys.</param>
+    /// <param name="id">Positive committed provider payment id; never an upstream remote invoice id.</param>
+    /// <param name="purpose">Immutable provider payment purpose, already validated as wallet_charge.</param>
+    /// <param name="botId">Immutable originating internal runtime id.</param>
+    /// <param name="botType">Saved owned/tenant family; tenant invoices never read or write campaigns.</param>
+    /// <param name="userId">Global Telegram id read from the committed provider invoice.</param>
+    /// <param name="chatId">Private Telegram destination captured in the invoice; never derived from provider data.</param>
+    /// <param name="amount">Original wallet principal in whole Iranian toman, before fees.</param>
+    /// <param name="token">Cancellation of the local reads and atomic snapshot write.</param>
+    /// <returns>A task completing before calling the provider, even if the frozen offer is zero.</returns>
+    /// <remarks>No balance changes occur. Campaign settings and issuance are serialized in users.db; existing promises
+    /// never change. This does not authorize retry of a provider mutation or change the amount sent to the provider.</remarks>
+    private async Task FreezeCampaignAsync(string provider, int id, string purpose, string botId, string botType,
+        long userId, long chatId, long amount, CancellationToken token)
+    {
+        if (botType != BotInstanceTypes.Owned || credentials == null || registry?.DefaultBot == null) return;
+        var user = await credentials.GetUserStatusWithId(userId);
+        var eligible = user != null && chatId == userId &&
+            WalletChargeCampaignService.IsEligible(purpose, botType, botId, registry.DefaultBot.Id, user.IsColleague);
+        await workflow.WriteAsync(async db =>
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(token);
+            if (await WalletChargeCampaignService.FindAsync(db, provider, id, token) != null) return 0;
+            var settings = eligible ? await db.WalletChargeCampaigns.FindAsync([1], token) : null;
+            var bonus = WalletChargeCampaignService.Quote(settings, amount);
+            bonus.Provider = provider;
+            bonus.PaymentId = id;
+            bonus.BotId = botId;
+            bonus.TelegramUserId = userId;
+            bonus.ChatId = chatId;
+            db.WalletChargeBonuses.Add(bonus);
+            await db.SaveChangesAsync(token);
+            await transaction.CommitAsync(token);
+            return 1;
+        }, token);
     }
 
     /// <summary>Revalidates live admission immediately before the external invoice mutation for either bot family.</summary>

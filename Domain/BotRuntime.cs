@@ -523,6 +523,8 @@ namespace Adminbot.Domain
     public static class WalletLedgerReasons
     {
         public const string WalletCharge = "wallet_charge";
+        /// <summary>Positive campaign gift linked to an officially settled wallet-charge payment, separate from principal.</summary>
+        public const string WalletChargeBonus = "wallet_charge_bonus";
         public const string AccountPurchase = "account_purchase";
         /// <summary>Positive exact-amount compensation of an owned colleague's paid test after durable non-creation proof.</summary>
         /// <remarks>Links to the original debit and grant through receipt keys; never used for an ambiguous or applied panel attempt.</remarks>

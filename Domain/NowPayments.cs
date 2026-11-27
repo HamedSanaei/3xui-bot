@@ -853,8 +853,8 @@ namespace Adminbot.Domain
         /// The persisted payment-row flag prevents a repeated callback in the running service from changing the
         /// wallet twice. Repeated IPNs repair a missing users.db ledger and replay pending referral work.
         /// Tenant, partial, provisional, pending, failed, and refunded rows are not eligible for this referral path.
-        /// The first credit and its unique customer-notification row are saved together; Telegram retries are handled
-        /// by a delivery-only worker that has no wallet or settlement dependency.
+        /// The first credit marker saves with either its unique outbox row or its official campaign promise; partial
+        /// crypto credit cannot release the latter. Telegram retries have no wallet or settlement dependency.
         /// The single combined customer confirmation includes the committed wallet receipt balance and explains that
         /// credit can buy or renew an account; funding alone does not activate it or change its status.
         /// </remarks>
@@ -918,7 +918,7 @@ namespace Adminbot.Domain
                 payment.SettledAtUtc ??= DateTime.UtcNow;
                 // Persist delivery with the first-credit marker; retries never call this financial service.
                 var notificationChatId = notifyChatId.GetValueOrDefault(payment.WalletOriginBotType == BotInstanceTypes.Tenant ? payment.ChatId : credUser.ChatID);
-                _workflow.Add(
+                await WalletChargeCampaignService.StageOfficialCreditAsync(_workflow,
                     PaymentSettlementNotification.CreateWalletCredit(
                         provider: "nowpayments",
                         providerPaymentId: payment.Id,
@@ -928,7 +928,7 @@ namespace Adminbot.Domain
                         amountToman: payment.AmountToman,
                         messageText: $"اعتبار کیف پول شما به میزان {payment.AmountToman.FormatCurrency()} افزایش یافت.",
                         createdAtUtc: payment.SettledAtUtc.Value, botType: payment.WalletOriginBotType, balanceAfter: afterBalance,
-                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId));
+                        walletOriginTelegramBotId: payment.WalletOriginTelegramBotId), walletReceipt, cancellationToken);
                 await _workflow.SaveAsync(cancellationToken);
 
                 await EnsureOriginalLedgerAsync(

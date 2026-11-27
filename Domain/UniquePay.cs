@@ -1163,7 +1163,8 @@ public sealed class UniquePaySettlementService
     /// wallet mutations when return, customer button, and worker race. The append-only ledger has a second unique key.
     /// Each attempt reloads the payment through an independent users.db context so the paid state written by the
     /// authoritative reconciliation context cannot be hidden by a stale singleton EF Core change tracker. The first
-    /// credit and unique notification row are committed in one users.db save; retry delivery cannot call settlement.
+    /// credit marker and either its unique notification or official campaign promise share one users.db save.
+    /// Delivery retry cannot call settlement, and the amount used for referral excludes campaign credit.
     /// The one combined customer confirmation includes the committed wallet receipt balance and explains that credit
     /// can buy or renew an account; funding alone does not activate it or change its status.
     /// </remarks>
@@ -1298,7 +1299,7 @@ public sealed class UniquePaySettlementService
             tracked.UpdatedAtUtc = DateTime.UtcNow;
             // The unique outbox row shares the same users.db save as the exactly-once settlement marker.
             var notificationChatId = notifyChatId ?? tracked.ChatId;
-            context.Add(
+            await WalletChargeCampaignService.StageOfficialCreditAsync(context,
                 PaymentSettlementNotification.CreateWalletCredit(
                     provider: "uniquepay",
                     providerPaymentId: tracked.Id,
@@ -1308,7 +1309,7 @@ public sealed class UniquePaySettlementService
                     amountToman: tracked.BaseAmountToman,
                     messageText: $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.",
                     createdAtUtc: tracked.SettledAtUtc.Value, botType: tracked.WalletOriginBotType, balanceAfter: after,
-                    walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId));
+                    walletOriginTelegramBotId: tracked.WalletOriginTelegramBotId), walletReceipt, cancellationToken);
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, before, after, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
@@ -1727,7 +1728,8 @@ public sealed class UniquePaySettlementService
     /// <param name="source">Non-secret inquiry source that observed the official confirmation.</param>
     /// <param name="cancellationToken">Cancellation token for the users.db audit update.</param>
     /// <returns>A task that completes after a new audit is saved or an existing confirmation is left unchanged.</returns>
-    /// <remarks>No wallet, referral, or ledger mutation is performed.</remarks>
+    /// <remarks>No wallet, referral, or ledger mutation is performed here. A positive invoice-time campaign promise
+    /// can be staged for credit once this official confirmation is durable.</remarks>
     private async Task RecordProviderConfirmationAfterProvisionalAsync(
         UserWorkflowStore context,
         UniquePayPaymentInfo payment,
@@ -1744,6 +1746,8 @@ public sealed class UniquePaySettlementService
         }
 
         payment.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+        await WalletChargeCampaignService.StageProvisionalConfirmationAsync(context, _credentialsDbContext,
+            "uniquepay", payment.Id, payment.BotId, cancellationToken);
         payment.UpdatedAtUtc = DateTime.UtcNow;
         await context.SaveAsync(cancellationToken);
         _logger.LogPayment(

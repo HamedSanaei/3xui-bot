@@ -807,7 +807,8 @@ public sealed partial class AtlasPaySettlementService
     /// can buy or renew an account; funding alone does not activate it or change its status.
     /// Approval revocation does not block a previously created invoice's legitimate settlement.</remarks>
     /// <remarks>Tenant wallet top-ups use the shared receipt-backed customer/owner report and durable Sales Assistant
-    /// notification after mirror credit; owned audit formatting and all financial operation keys remain unchanged.</remarks>
+    /// notification after mirror credit; owned audit formatting and original financial operation keys remain unchanged.
+    /// A matched owned campaign promise replaces the ordinary outbox with a combined receipt after the separate gift commits.</remarks>
     /// <example><code>var result = await service.ApplyOfficialPaymentAsync(payment, "webhook-inquiry", token);</code></example>
     public async Task<NowPaymentsSettlementResult> ApplyOfficialPaymentAsync(AtlasPayPaymentInfo payment, string source,
         CancellationToken cancellationToken = default)
@@ -877,10 +878,10 @@ public sealed partial class AtlasPaySettlementService
             tracked.SettlementAttemptId = null; tracked.SettlementStartedAtUtc = null;
             tracked.BalanceBefore = receipt.BeforeBalance; tracked.BalanceAfter = receipt.AfterBalance;
             tracked.SettledAtUtc ??= DateTime.UtcNow; tracked.NextInquiryAtUtc = null; tracked.ErrorCode = null; tracked.ErrorMessage = null; tracked.UpdatedAtUtc = DateTime.UtcNow;
-            context.Add(PaymentSettlementNotification.CreateWalletCredit("atlaspay", tracked.Id, tracked.BotId,
+            await WalletChargeCampaignService.StageOfficialCreditAsync(context, PaymentSettlementNotification.CreateWalletCredit("atlaspay", tracked.Id, tracked.BotId,
                 tracked.TelegramUserId, tracked.ChatId, tracked.BaseAmountToman,
                 $"اعتبار کیف پول شما به میزان {tracked.BaseAmountToman.FormatCurrency()} افزایش یافت.", tracked.SettledAtUtc.Value, tracked.WalletOriginBotType, receipt.AfterBalance,
-                tracked.WalletOriginTelegramBotId));
+                tracked.WalletOriginTelegramBotId), receipt, cancellationToken);
             await context.SaveAsync(cancellationToken);
             await EnsureLedgerAsync(tracked, receipt.BeforeBalance, receipt.AfterBalance, cancellationToken);
             await ProcessReferralAsync(tracked, cancellationToken);
@@ -1125,7 +1126,8 @@ public sealed partial class AtlasPaySettlementService
     /// <param name="source">Non-secret trigger label that observed the official provider confirmation.</param>
     /// <param name="cancellationToken">Cancellation token for the users.db audit update.</param>
     /// <returns>A task completing after the audit marker and logger message are written, or a safe no-op.</returns>
-    /// <remarks>No wallet, ledger, referral, or customer-notification mutation is performed.</remarks>
+    /// <remarks>No wallet, ledger, referral, or customer-notification mutation is performed here. Official proof can
+    /// stage the invoice's separately keyed campaign gift for the reconciliation worker.</remarks>
     public async Task RecordProviderConfirmationAfterProvisionalAsync(
         AtlasPayPaymentInfo payment,
         string source,
@@ -1150,6 +1152,8 @@ public sealed partial class AtlasPaySettlementService
             }
 
             tracked.ProviderConfirmedAfterProvisionalAtUtc = DateTime.UtcNow;
+            await WalletChargeCampaignService.StageProvisionalConfirmationAsync(context, _credentials,
+                "atlaspay", tracked.Id, tracked.BotId, cancellationToken);
             tracked.NextInquiryAtUtc = null;
             tracked.ErrorCode = null;
             tracked.ErrorMessage = null;

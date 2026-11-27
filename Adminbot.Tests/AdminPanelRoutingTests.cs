@@ -170,6 +170,7 @@ public sealed class AdminPanelRoutingTests
         /// <param name="configuration">Required synthetic admin configuration; never production tokens.</param>
         /// <param name="botContextAccessor">Required accessor pushed with the test's exact Owned/Tenant context.</param>
         /// <param name="credentials">Optional isolated profile store for actor/role scenarios.</param>
+        /// <param name="workflow">Optional isolated users.db workflow for testing persistent campaign settings.</param>
         /// <remarks>No publisher worker or Telegram probe is started. Unrelated production collaborators remain null.</remarks>
         /// <exception cref="ArgumentNullException">The required configuration is null.</exception>
         /// <example><code>var probe = new ProbeTelegramBotService(state, sessions, config, accessor);</code></example>
@@ -178,10 +179,11 @@ public sealed class AdminPanelRoutingTests
             XuiV3PurchaseSessionStore sessions,
             IConfiguration configuration,
             BotContextAccessor botContextAccessor,
-            CredentialsStore? credentials = null)
+            CredentialsStore? credentials = null,
+            UserWorkflowStore? workflow = null)
             : base(
                 botClient: null,
-                dbContext: null,
+                dbContext: workflow,
                 stateStore: stateStore,
                 credentialsDb: credentials,
                 configuration: configuration,
@@ -305,7 +307,62 @@ public sealed class AdminPanelRoutingTests
             new XuiV3PurchaseSessionStore(),
             configuration,
             new BotContextAccessor(),
-            credentials);
+            credentials,
+            new UserWorkflowStore(fixture.Users));
+    }
+
+    /// <summary>Only the private owned super-admin can persist settings, and edits survive reopening the panel.</summary>
+    /// <returns>A task verifying authorization and enable, name, percent, pause and restart behavior.</returns>
+    [Fact]
+    public async Task WalletCampaign_Admin_changes_are_persistent_and_restricted_to_private_owned_context()
+    {
+        using var fixture = new Fixture();
+        using var http = new HttpClient(new CampaignTelegramHandler());
+        var client = new TelegramBotClient("123:fixture", http);
+        var accessor = new BotContextAccessor();
+        var probe = BuildProbe(fixture, new[] { SuperAdminId });
+        Assert.Contains("🎁 مدیریت هدیه شارژ", AdminActions(probe));
+        var handler = typeof(TelegramBotService).GetMethod("TryHandleWalletChargeCampaignAdminAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Task<bool> Send(TelegramBotService service, long id, string text) =>
+            (Task<bool>)handler.Invoke(service, new object[] { client, AdminMessage(id, text, id), CancellationToken.None })!;
+        using (accessor.Push(TenantContext("tenant-a")))
+            Assert.False(await Send(probe, SuperAdminId, "▶️ فعال‌سازی هدیه شارژ"));
+        using var owned = accessor.Push(OwnedContext("main"));
+        Assert.False(await Send(probe, TargetUserId, "▶️ فعال‌سازی هدیه شارژ"));
+        await using var db = fixture.Users.CreateDbContext();
+        Assert.Empty(await db.WalletChargeCampaigns.ToListAsync());
+        Assert.True(await Send(probe, SuperAdminId, "🎁 مدیریت هدیه شارژ"));
+        Assert.True(await Send(probe, SuperAdminId, "▶️ فعال‌سازی هدیه شارژ"));
+        Assert.True(await Send(probe, SuperAdminId, "✏️ ویرایش نام کمپین"));
+        Assert.True(await Send(probe, SuperAdminId, "هدیه آزمایشی"));
+        Assert.True(await Send(probe, SuperAdminId, "🔢 تغییر درصد هدیه"));
+        Assert.True(await Send(probe, SuperAdminId, "۱۵"));
+        var saved = await db.WalletChargeCampaigns.AsNoTracking().SingleAsync();
+        Assert.True(saved.Enabled);
+        Assert.Equal("هدیه آزمایشی", saved.Name);
+        Assert.Equal(15, saved.Percent);
+        var restarted = BuildProbe(fixture, new[] { SuperAdminId });
+        Assert.True(await Send(restarted, SuperAdminId, "⏸ غیرفعال‌سازی هدیه شارژ"));
+        saved = await db.WalletChargeCampaigns.AsNoTracking().SingleAsync();
+        Assert.False(saved.Enabled);
+        Assert.Equal(15, saved.Percent);
+        Assert.Equal("هدیه آزمایشی", saved.Name);
+    }
+
+    /// <summary>Supplies a synthetic Telegram acknowledgement without sending a network request.</summary>
+    private sealed class CampaignTelegramHandler : HttpMessageHandler
+    {
+        /// <summary>Accepts the admin panel request and returns a minimal successful message.</summary>
+        /// <param name="request">Outgoing Telegram API request from the admin panel.</param>
+        /// <param name="cancellationToken">Cancellation of fake delivery.</param>
+        /// <returns>A successful in-memory Telegram response.</returns>
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":1,"type":"private"}}}""",
+                    System.Text.Encoding.UTF8, "application/json")
+            });
     }
 
     /// <summary>Builds an owned-bot runtime context for the accessor push.</summary>

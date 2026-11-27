@@ -4,8 +4,8 @@ using Microsoft.EntityFrameworkCore;
 /// <summary>Repairs committed wallet audit metadata and exact paid-test refunds after a cross-database crash.</summary>
 /// <remarks>
 /// Immutable credentials.db receipts are the financial source of truth; ledger idempotency closes the separate
-/// users.db commit window. The worker never calls payment/XUI providers or creates an account. Its sole balance
-/// mutation is an idempotent exact debit-linked colleague-test refund after durable definitive non-creation.
+/// users.db commit window. The worker never calls payment/XUI providers or creates an account. Its only balance
+/// mutations are idempotent exact debit-linked colleague-test refunds and promised, officially authorized wallet bonuses.
 /// </remarks>
 public sealed partial class WalletOperationReconciliationService : BackgroundService
 {
@@ -49,14 +49,15 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
 
     /// <summary>Repairs one batch of wallet events whose normal caller had time to finish its second commit.</summary>
     /// <param name="token">Cancellation of database-only recovery.</param>
-    /// <returns>Number of repaired wallet receipts plus newly proof-recorded exact paid-test refunds.</returns>
+    /// <returns>Number of repaired wallet receipts, exact paid-test refunds and completed charge bonuses.</returns>
     /// <remarks>Receipts and refund recovery candidates younger than one minute remain with their active caller. No history is inferred from current balances.
     /// Confirmed website debt transfers first repair their idempotent local credit; no website mutation is retried.
     /// Tenant customer receipts reconstruct exact order-linked debit/refund metadata; charge origin comes from persisted
     /// provider rows so a background worker cannot mislabel tenant credit as owned or redirect its notification.
     /// Owned paid-test receipts rebuild their grant-linked purchase/refund audit without starting panel work.
     /// Rejected or durably proven-absent paid tests receive the exact original debit-linked refund once, independently
-    /// of cleared Telegram conversation state. Ambiguous/Applied creations never authorize compensation.</remarks>
+    /// of cleared Telegram conversation state. Ambiguous/Applied creations never authorize compensation.
+    /// Campaign credits use a separate namespace and require the previously authorized exact principal receipt.</remarks>
     /// <example><code>var repaired = await reconciliation.ReconcileAsync(token);</code></example>
     public async Task<int> ReconcileAsync(CancellationToken token = default)
     {
@@ -77,7 +78,8 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
         await using (var db = _credentials.CreateDbContext())
         {
             var cutoff = DateTime.UtcNow.AddMinutes(-1);
-            receipts = await db.WalletOperations.AsNoTracking().Where(x => x.ReconciledAtUtc == null && x.CreatedAtUtc <= cutoff)
+            receipts = await db.WalletOperations.AsNoTracking().Where(x => x.ReconciledAtUtc == null && x.CreatedAtUtc <= cutoff &&
+                    !x.OperationKey.StartsWith(WalletChargeCampaignService.BonusOperationPrefix))
                 .OrderBy(x => x.CreatedAtUtc).Take(100).ToListAsync(token);
         }
         var repaired = 0;
@@ -208,7 +210,8 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
                     receipt.OperationKey, ex.GetType().Name);
             }
         }
-        return repaired + recoveredTrialRefunds;
+        return repaired + recoveredTrialRefunds +
+            await WalletChargeCampaignService.ReconcileAsync(_users, _credentials, _ledger, _logger, token);
     }
 
     /// <summary>Repairs a personal-card tenant wallet top-up after credentials.db committed before users.db.</summary>
@@ -318,7 +321,8 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
     /// <remarks>Tenant order fulfillment and XUI delivery remain with their existing sagas; a wallet receipt alone does not prove delivery.
     /// A missing or mismatched payment target throws and leaves the receipt pending for operator review.
     /// A missing first-credit notice is restored once with the receipt's post-credit balance and purchase/renewal
-    /// guidance; this repair never treats wallet funding as account activation or replaces an existing notice.</remarks>
+    /// guidance, or schedules a matching campaign promise using official receipt evidence. It never treats wallet
+    /// funding as account activation, promotes a provisional credit, or replaces an existing notice.</remarks>
     /// <example><code>await RepairSettlementAsync(committedReceipt, token);</code></example>
     private async Task RepairSettlementAsync(WalletOperation receipt, CancellationToken token)
     {
@@ -425,7 +429,11 @@ public sealed partial class WalletOperationReconciliationService : BackgroundSer
                         receipt.TelegramUserId, chatId, receipt.AmountToman,
                         "اعتبار کیف پول شما افزایش یافت.", receipt.CreatedAtUtc, botType, receipt.AfterBalance,
                         walletOriginTelegramBotId);
-                    if (!await db.PaymentSettlementNotifications.AnyAsync(x => x.NotificationKey == notification.NotificationKey, ct))
+                    // Recovery uses only committed official receipts, never promotes partial/provisional credits.
+                    var bonusOwnsNotice = botType == BotInstanceTypes.Owned && receipt.ApprovalKind == "official" &&
+                        WalletChargeCampaignService.MarkReady(await WalletChargeCampaignService.FindAsync(db, parts[1], id, ct),
+                            receipt, botId, false);
+                    if (!bonusOwnsNotice && !await db.PaymentSettlementNotifications.AnyAsync(x => x.NotificationKey == notification.NotificationKey, ct))
                         db.PaymentSettlementNotifications.Add(notification);
                 }
             }

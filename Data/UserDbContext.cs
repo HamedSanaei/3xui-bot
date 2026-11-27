@@ -121,6 +121,12 @@ public class UserDbContext : DbContext
     /// </summary>
     public DbSet<PaymentSettlementNotification> PaymentSettlementNotifications { get; set; }
 
+    /// <summary>Global singleton campaign settings; the default when no row exists is disabled.</summary>
+    public DbSet<WalletChargeCampaign> WalletChargeCampaigns { get; set; }
+
+    /// <summary>Invoice-scoped wallet bonus promises and durable recovery state; no historical backfill.</summary>
+    public DbSet<WalletChargeBonus> WalletChargeBonuses { get; set; }
+
     public DbSet<ZibalPaymentInfo> ZibalPaymentInfos { get; set; }
 
     /// <summary>
@@ -186,6 +192,7 @@ public class UserDbContext : DbContext
     /// Creation-operation UUID read-back evidence is optional and stays on the original operation key; the POST payload is not rewritten.
     /// Active customer restrictions use the storefront/customer composite key, with logical links to the bot and source receipt.
     /// The pending receipt lookup is nonunique to retain existing receipt evidence. No restrictions are inferred during migration.
+    /// Campaign promises use a provider/local-payment composite key and a due-recovery index; there is no historical backfill.
     /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -255,6 +262,13 @@ public class UserDbContext : DbContext
             entity.Property(x => x.Status).IsRequired();
         });
         base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<WalletChargeCampaign>().Property(x => x.Id).ValueGeneratedNever();
+        modelBuilder.Entity<WalletChargeBonus>(entity =>
+        {
+            entity.HasKey(x => new { x.Provider, x.PaymentId });
+            entity.HasIndex(x => new { x.CompletedAtUtc, x.NextAttemptAtUtc });
+        });
 
         modelBuilder.Entity<SwapinoPaymentInfo>(entity =>
         {

@@ -28,6 +28,7 @@ public sealed partial class ConcurrencyTests
         await wallet.AddEmptyUser(456);
         await using (var db = databases.Users.CreateDbContext())
         {
+            db.WalletChargeCampaigns.Add(new WalletChargeCampaign { Enabled = true });
             var store = await db.BotInstances.SingleAsync();
             store.TenantHooshPayEnabled = store.TenantTetraminatorEnabled = store.TenantUniquePayEnabled =
                 store.TenantAtlasPayEnabled = store.TenantNowPaymentsEnabled = false;
@@ -78,9 +79,11 @@ public sealed partial class ConcurrencyTests
         var charges = new WalletChargeApplicationService(workflow, config.Get<AppConfig>()!, availability, policy,
             TenantWalletFundingAccess(databases, config),
             new HooshPay(config, Client()), new Tetraminator(config, Client()), new UniquePay(config, Client()),
-            new AtlasPay(config, Client()), new NowPayments(config, Client(), new TenantWalletQuote()));
+            new AtlasPay(config, Client()), new NowPayments(config, Client(), new TenantWalletQuote()), wallet, new BotRegistry(config));
         var invoice = await charges.CreateTenantAsync("tenant-a", 123, 123, 100000, gateway, default);
         Assert.NotEmpty(invoice.Url); Assert.Equal(1, posts);
+        await using (var promises = databases.Users.CreateDbContext())
+            Assert.Empty(await promises.WalletChargeBonuses.ToListAsync());
         if (gateway == PaymentGateway.Tetraminator)
         {
             // Both links identify ONE invoice; the actual tenant wallet flow must expose bot then online choices,

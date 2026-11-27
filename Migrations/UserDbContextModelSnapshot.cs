@@ -8,7 +8,7 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace Adminbot.Migrations
 {
-    /// <summary>Current users.db model including tenant receipt lookup and storefront customer restrictions.</summary>
+    /// <summary>Current users.db model including issued wallet campaign promises and their recovery index.</summary>
     [DbContext(typeof(UserDbContext))]
     partial class UserDbContextModelSnapshot : ModelSnapshot
     {
@@ -2930,6 +2930,70 @@ namespace Adminbot.Migrations
                     b.HasIndex("Status", "LeaseUntilUtc");
 
                     b.ToTable("UsageReportDispatches", (string)null);
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.WalletChargeBonus", b =>
+                {
+                    b.Property<string>("Provider")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("PaymentId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("BonusToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BotId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("CompletedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Name")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextAttemptAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Percent")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("PrincipalToman")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("ProvisionalConfirmed")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Provider", "PaymentId");
+
+                    b.HasIndex("CompletedAtUtc", "NextAttemptAtUtc");
+
+                    b.ToTable("WalletChargeBonuses");
+                });
+
+            modelBuilder.Entity("Adminbot.Domain.WalletChargeCampaign", b =>
+                {
+                    b.Property<int>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Name")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Percent")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("WalletChargeCampaigns");
                 });
 
             modelBuilder.Entity("Adminbot.Domain.WalletLedgerEntry", b =>
